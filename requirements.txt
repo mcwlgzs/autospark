@@ -17,12 +17,37 @@ selenium==4.49.0
 requests==2.34.2
 python-multipart==0.0.32
 
-# 数据库支持
+# 数据库支持（异步）
 sqlalchemy==2.0.36
 alembic==1.14.0
+aiosqlite==0.20.0
+aiomysql==0.2.0
 
-# 密码加密（如果还没有的话）
+# 密码和安全
 bcrypt==4.2.1
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+cryptography==42.0.5
+
+# Selenium 反检测
+undetected-chromedriver==3.5.5
+selenium-stealth==1.0.6
+
+# 任务调度
+fastapi-scheduler==0.0.15
+APScheduler==3.10.4
+
+# 监控和日志
+structlog==24.1.0
+prometheus-fastapi-instrumentator==7.0.0
+
+# 性能优化
+redis==5.0.1
+celery==5.3.6
+
+# 数据处理
+pandas==2.2.1
+openpyxl==3.1.2
 
 # ---- 以下是上面这些包带来的间接依赖，仅供排查问题时对照，不要显式安装 ----
 # 之所以写在这里而不是钉进上面的列表：它们是 fastapi 的传递依赖，
