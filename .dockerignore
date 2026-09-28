@@ -1,0 +1,63 @@
+# 构建上下文排除清单。
+#
+# 为什么必须有这个文件：Docker 在构建前会把整个目录打包发给守护进程，
+# 只有排除了下面这些，才不会出现「构建要等三分钟」或者
+# 「镜像里莫名多出 500MB 的 Chrome profile / 几万个 node_modules 文件」。
+# 注意这不是 .gitignore，两者要分别维护：这里排的是「不该进镜像」，
+# .gitignore 排的是「不该进仓库」。
+
+# ---- 前端依赖与产物 ----
+node_modules
+dist
+public
+
+# ---- Python 环境与缓存 ----
+.venv
+venv
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.ruff_cache
+
+# ---- 运行期数据：绝不能打进镜像 ----
+# chrome-profile 尤其危险：体积大、含登录 cookie，进镜像等于把账号凭据带出去。
+chrome-profile
+data
+logs
+*.log
+temp.png
+.home
+debug
+drivers
+
+# ---- 版本控制与编辑器杂项 ----
+.git
+.gitignore
+.github
+*.bak
+*.bak-*
+*.broken.bak
+*.zip
+*.pass
+*password*.txt
+.env
+.idea
+.vscode
+
+# ---- 文档、部署脚本与测试：镜像里用不到 ----
+README.md
+LOCAL_RUN.md
+FORK_NOTES.md
+LICENSE.txt
+deploy
+tests
+pyproject.toml
+requirements-dev.txt
+docker-compose.yml
+start-backend.ps1
+start-backend.sh
+package.json
+package-lock.json
+index.html
+vite.config.js

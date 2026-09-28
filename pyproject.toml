@@ -1,0 +1,63 @@
+# ============================================================
+# 工具配置（pytest / ruff）
+#
+# 这个文件不放 [project] 和 [build-system]：本仓库不是一个要发布的
+# Python 包（后端是直接 python backend.py 起的），装这两个段落只会
+# 让 pip install -e . 之类的操作产生误解。
+# 它唯一的作用，是让 pytest 和 ruff 在仓库根目录下有一份统一配置。
+# ============================================================
+
+[tool.pytest.ini_options]
+# 只收 tests/ 下的用例。不加这条的话，pytest 会从根目录开始递归收集，
+# 一旦哪天有人在仓库里放了临时脚本，就可能被当成测试收进来（甚至执行）。
+testpaths = ["tests"]
+
+[tool.ruff]
+# 120 列：backend.py 里有不少长 XPath 和长字符串，收到 80~100 列会逼着人
+# 把本来更可读的整行写法拆碎，收益不大。
+line-length = 120
+# 后端要求 Python 3.10+，告诉 ruff 别推荐只有更高版本才支持的语法。
+target-version = "py310"
+
+[tool.ruff.lint]
+# E/W：pycodestyle（格式与明显笔误）
+# F  ：pyflakes（未定义名、未使用导入等真正会出 bug 的检查）
+# I  ：import 排序
+# UP ：pyupgrade（过时写法）
+# B  ：flake8-bugbear（可疑写法，比如可变默认参数）
+select = ["E", "F", "W", "I", "UP", "B"]
+
+ignore = [
+    # 行长超限属于格式化工具该管的事，不该让 CI 红：
+    # 真正需要断行的地方往往是长 URL / 长 XPath，硬拆反而更难读。
+    "E501",
+
+    # B008：默认参数里调用函数。这条对 FastAPI 是纯误报 ——
+    # 路由签名必须写 `dep=Depends(...)` / `authorization: str = Header(None)`，
+    # FastAPI 正是靠读默认值来注入依赖的，改了功能就废了。
+    "B008",
+
+    # UP031：把 % 格式化改成 format specifier。本仓库 backend.py 有近百处、
+    # spark_core / state_store / notifier 里也有十几处，统一改写属于纯风格改动，
+    # 风险大于收益（而且这三个文件本轮不允许改动），所以直接关掉。
+    "UP031",
+
+    # UP015：open(f, 'r') 里的 'r' 是冗余的。这里保留显式写法是刻意的 ——
+    # 读写日志、state.json 的地方不少，显式写明模式比省两个字符更好读。
+    "UP015",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# backend.py 是 4000 行的历史代码，风格本来就不统一，而且它正在被并行重构。
+#
+# 策略：只保留 pyflakes 里最硬的那几条（未定义名 F821、重复定义 F811、
+# 语法级问题），把格式与升级建议类规则全部放宽 —— 否则第一次跑 CI 就是
+# 几百上千条，团队会直接选择无视这个 job，等于没有 lint。
+#
+# 其中单独解释一条容易误伤的：
+#   F841（赋值了但没读过的局部变量）：backend.py 大量用 `global` 在函数里改写
+#        模块级状态，静态看就像「赋值后没人读」，属于误报。
+# 另外 F401（导入未使用）也在这里放宽：backend.py 正在被重构，
+#        重构中间态难免出现「先导入、稍后才接上」的符号；
+#        等重构收尾后建议把它从下面这行删掉，恢复对未使用导入的检查（TODO）。
+"backend.py" = ["E", "W", "I", "UP", "B", "F841", "F401"]

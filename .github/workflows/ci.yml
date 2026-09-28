@@ -1,0 +1,72 @@
+# ============================================================
+# CI：单元测试 + 代码检查
+#
+# 触发时机：推送到 main、以及任何 pull_request。
+# 刻意不覆盖所有分支的 push —— 个人分支上每推一次都跑一遍，
+# 既费额度也没人看，PR 打开时再跑就够了。
+# ============================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# 默认的 GITHUB_TOKEN 权限是只读，这里显式收紧成只读，
+# 避免将来有人不小心在工作流里拿到写权限。
+permissions:
+  contents: read
+
+jobs:
+  # ---------- 单元测试 ----------
+  test:
+    name: 单元测试
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          # 和 systemd/Docker 部署用的版本保持一致，避免「CI 过了线上炸」。
+          python-version: "3.11"
+
+      # 只装开发依赖，不装 requirements.txt。
+      # 原因：tests/ 里的用例只依赖标准库 + spark_core / state_store / notifier，
+      # 不碰 selenium / fastapi。装 requirements.txt 会拖进一整套运行时依赖
+      # （还得拉 Chromium），流水线白白慢好几分钟，却什么都验证不了。
+      - name: 安装开发依赖（pytest / ruff）
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      - name: 运行测试
+        # 把仓库根目录加进 PYTHONPATH：测试文件自己也会调 sys.path，
+        # 这里是从环境侧再兜一层，保证 `import spark_core` 一定能找到。
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: python -m pytest -q
+
+  # ---------- 代码检查 ----------
+  lint:
+    name: 代码检查（ruff）
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装开发依赖（pytest / ruff）
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+
+      # 规则和放宽策略全在 pyproject.toml 里，这里不加任何参数，
+      # 保证「本地 ruff check .」和 CI 行为完全一致。
+      - name: 运行 ruff
+        run: ruff check .

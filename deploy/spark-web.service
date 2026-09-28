@@ -1,0 +1,74 @@
+# ============================================================
+# 抖音火花助手 自托管面板 —— systemd 单元（Linux 直装，不用 Docker）
+#
+# 安装步骤（假设代码放在 /opt/spark-web）：
+#   1. 放代码并按需建账号（容器里那套 uid 1000 的约定在这里同样适用）：
+#        sudo useradd --create-home --shell /bin/bash spark      # 已存在就跳过
+#        sudo cp -r . /opt/spark-web && sudo chown -R spark:spark /opt/spark-web
+#   2. 把启动脚本补上可执行权限（从 Windows 传过来的文件常常没有 x 位）：
+#        sudo chmod +x /opt/spark-web/start-backend.sh
+#   3. 安装本单元并启动：
+#        sudo cp deploy/spark-web.service /etc/systemd/system/spark-web.service
+#        sudo systemctl daemon-reload
+#        sudo systemctl enable --now spark-web
+#   4. 查看状态与日志（日志统一走 journald，不再单独 tail 文件）：
+#        systemctl status spark-web
+#        journalctl -u spark-web -f
+#
+# 说明：
+#   * start-backend.sh 自己会建 .venv 并装依赖，所以第一次启动会比较慢，
+#     这时 status 里看到它就是「正在跑」而不是卡死；等 /healthz 通了即可。
+#   * 想换端口/时区/随机窗口等参数，用下面的 Environment= 追加即可，
+#     变量名见 README 或 docker-compose.yml 里的说明。
+# ============================================================
+[Unit]
+Description=抖音火花助手 自托管面板（FastAPI + 可见 Chrome）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# 以普通用户运行：Chrome 和面板都不需要 root 权限，
+# 用 root 跑等于把所有文件都变成 root 属主，之后想改配置还得 sudo。
+# 不想建账号就把这两行删掉（默认 root）。
+User=spark
+Group=spark
+
+WorkingDirectory=/opt/spark-web
+
+# 后端只监听 127.0.0.1，必须由 nginx 之类反代对外（见 deploy/README.md）。
+Environment=PORT=9844
+# 日志不缓冲，journalctl 才能实时看到，而不是攒一批才吐出来。
+Environment=PYTHONUNBUFFERED=1
+# 时区决定「每天 22:00 发送」到底指几点，容器/服务器默认 UTC 会差 8 小时。
+Environment=TZ=Asia/Shanghai
+
+# 用 xvfb-run 提供虚拟显示 —— 本项目用「可见」Chrome，
+# 没有 $DISPLAY 时 Chrome 直接起不来（backend.py 会返回
+# “初始化失败: 未找到可用的 DISPLAY/Xvfb 环境”）。
+#
+# 屏幕尺寸不能省：Chrome 是按 --window-size=1400,3200 启动的，
+# 而 xvfb-run 默认只有 1280x1024，窗口比屏幕大时验证码截图会被裁掉。
+#
+# 注意 start-backend.sh 内部也会判断 $DISPLAY 并自己套一层 xvfb-run，
+# 这里已经用 xvfb-run 起了，所以进去之后 DISPLAY 是有值的，不会重复嵌套。
+ExecStart=/usr/bin/xvfb-run -a -s "-screen 0 1440x3400x24" /opt/spark-web/start-backend.sh
+
+# 崩了就一直拉起来（含开机自启）；确实要停就用 systemctl stop，不会自己回来。
+Restart=always
+RestartSec=5
+
+# 退出时给 uvicorn 一点时间收尾（关闭浏览器、落盘 state.json）。
+# KillMode=mixed 是为了对付中间那层 xvfb-run 包装脚本：
+# 只给主进程发信号的话，Chrome 和 Xvfb 可能变成孤儿进程留在系统里。
+KillMode=mixed
+TimeoutStopSec=30
+
+# 日志全部交给 journald，不再让脚本自己写日志文件。
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=spark-web
+
+[Install]
+WantedBy=multi-user.target

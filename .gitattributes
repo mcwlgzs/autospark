@@ -1,0 +1,15 @@
+# 换行符策略。
+#
+# 这个仓库同时在 Windows（开发）和 Linux（部署）上使用，
+# 而 git 默认的 core.autocrlf 会把文本文件检出成 CRLF —— 对下面这些
+# 「在 Linux 上要直接被内核 / systemd 执行」的文件是致命的：
+#   bash: ./start-backend.sh: /bin/bash^M: bad interpreter: No such file or directory
+# 报错信息完全看不出是换行符的问题，非常难查。所以这里强制锁定 LF。
+#
+# 只列必要项、不写全局 `* text=auto`：全局规则会让仓库里所有文件在下次
+# 提交时被重新规范化，产生一整个仓库的假改动，收益不值这个代价。
+*.sh text eol=lf
+deploy/*.service text eol=lf
+Dockerfile text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf

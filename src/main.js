@@ -1,0 +1,23 @@
+import { createApp } from 'vue'
+import { createPinia } from 'pinia'
+
+import router from './router'
+import App from './App.vue'
+import './style.css'
+
+const app = createApp(App)
+
+// Pinia
+app.use(createPinia())
+
+// 路由
+app.use(router)
+
+// Element Plus 不再在这里全量注册：改由 vite.config.js 里的
+// unplugin-vue-components + ElementPlusResolver 按模板里真实用到的标签按需引入。
+// 全局注册省事，但代价是整个组件库（含全部图标）无条件进主包 ——
+// 实测那一个 chunk 就有 1.1 MB，而后端只监听 127.0.0.1，面板常常是走内网/反代打开的。
+// 图标同理：以前 `for (const [k,v] of Object.entries(ElementPlusIconsVue))` 把
+// 上千个图标全注册了一遍，实际上各页面只 import 了自己用得上的那几个。
+
+app.mount('#app')

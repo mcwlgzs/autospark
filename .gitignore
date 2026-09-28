@@ -1,0 +1,22 @@
+node_modules/
+dist/
+.venv/
+venv/
+__pycache__/
+*.pyc
+chrome-profile/
+debug/
+drivers/
+*.log
+.env
+*.pass
+*password*.txt
+
+# 运行时状态与凭据：绝不能提交（state.json 里有推送 token、好友名与发送记账）
+data/
+logs/
+.home/
+*.zip
+*.bak
+*.bak-*
+*.broken.bak

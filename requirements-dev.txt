@@ -1,0 +1,14 @@
+# 开发 / 测试依赖：只给 CI 和本地跑测试用，不参与部署。
+#
+# 为什么和 requirements.txt 分开、而且这里不装运行时依赖：
+#   tests/ 里的用例只依赖标准库 + spark_core / state_store / notifier，
+#   不碰 selenium、不碰 fastapi、更不需要 Chrome。
+#   CI 上为了跑测试去装 selenium 只会白白拖慢流水线（还要拉 Chromium），
+#   所以 CI 只装这个文件。
+#
+# 这里故意用宽松范围（而不是 ==）：
+#   测试工具升级导致的失败一眼就能看出来是工具的锅，回归成本很低；
+#   而运行时依赖（requirements.txt）的失败会伪装成业务 bug，所以那边必须锁死。
+
+pytest>=8,<9
+ruff>=0.6,<1

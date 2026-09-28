@@ -1,0 +1,56 @@
+# ============================================================
+# 抖音火花助手 自托管面板 —— Docker Compose 部署
+#
+# 用法：
+#   docker compose up -d --build      # 首次构建并后台启动
+#   docker compose logs -f            # 看日志
+#   docker compose exec spark-web sh  # 进容器排查
+#
+# 刻意不写 version: 字段 —— 新版 Compose 已经不认它了，写了只会打警告。
+# ============================================================
+services:
+  spark-web:
+    build: .
+    # 只绑到宿主机 127.0.0.1，不写 0.0.0.0：
+    # 后端的登录接口没有 HTTPS、登录失败节流也只防本机，直接暴露到公网等于送人。
+    # 对外的入口交给 nginx 做 TLS 终止 + 反向代理（见 deploy/README.md）。
+    ports:
+      - "127.0.0.1:9844:9844"
+
+    # 三个目录必须映射出去，否则容器一删，登录态（扫码换来的 cookie）、
+    # 任务配置和发送记账全没了，得重新扫码。
+    # 注意属主问题：容器里以 uid 1000 运行，宿主机这几个目录必须能被 uid 1000 写，
+    # 首次部署如果启动就报权限错误，在宿主机执行：
+    #   mkdir -p data logs chrome-profile && sudo chown -R 1000:1000 data logs chrome-profile
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./chrome-profile:/app/chrome-profile
+
+    # 可选配置：把参数写进仓库根目录的 .env（该文件已在 .gitignore 里，不会被提交）。
+    # required: false 表示「没有 .env 也照常启动」，属于 Compose v2.24+ 的写法。
+    # 如果你的 compose 版本更老、报 env_file 解析错误，把下面两行整段删掉即可，
+    # 或者改成 `- .env` 并自己先创建好 .env 文件。
+    #
+    # .env 里常见可选项（backend.py 读的是环境变量）：
+    #   SPARK_JITTER_MINUTES=40        计划时间之后随机推迟的上限（分钟），0 = 不随机
+    #   SPARK_CATCHUP_GRACE_MINUTES=360 错过当天时间点后多久内还补跑，0 = 不补跑
+    #   SPARK_RETRY_AFTER_MINUTES=45   当日失败后隔多久补发一次，0 = 关闭补发
+    #   SPARK_TOKEN_TTL_HOURS=72       面板登录态空闲多久失效，0 = 永不过期
+    #   SPARK_SHOW_BROWSER=0           关掉可见浏览器（只在完全不需要人工验证时才用）
+    #   TZ=Asia/Shanghai               时区，影响「22:00 发送」的准点含义
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      # 容器内监听端口。Dockerfile 里也有 ENV PORT=9844，这里是显式再声明一次，
+      # 改端口时只要同步改上面的 ports 映射即可。
+      PORT: ${PORT:-9844}
+      # 时区一定要给：容器默认 UTC，会让「每天 22:00」变成北京时间早上 6 点，
+      # 日志时间也全对不上。镜像里已装 tzdata，这个变量才会生效。
+      TZ: ${TZ:-Asia/Shanghai}
+
+    # 崩了/被 OOM 杀掉后自动拉起；手工 docker compose stop 的不会被重启，
+    # 比 always 更符合「我明确要停它就别自己爬起来」的直觉。
+    restart: unless-stopped
