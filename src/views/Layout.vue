@@ -119,17 +119,17 @@
 
     <!-- 悬浮的浏览器截图：定时任务跑起来以后浏览器是一个独立窗口，光看面板
          不知道它在干什么（是不是卡在验证码、是不是已经登录失效）。PC 上常驻
-         右下角一个圆按钮，点开截一张当时的画面，需要时点「重新截图」再截一张。
-         不做实时刷新（一秒一帧既费资源，人也不盯着一只看），手机上不显示。 -->
+         右下角一个圆按钮：点一下截一张当时的画面，再点一下收起（按钮就是开关，
+         不用去够浮窗里的关闭）。不做实时刷新（一秒一帧既费资源，人也不盯着一只
+         看），手机上不显示。 -->
     <template v-if="!isMobile">
-      <el-tooltip content="截一张浏览器画面" placement="left">
+      <el-tooltip :content="screenVisible ? '收起浏览器截图' : '截一张浏览器画面'" placement="left">
         <button
-          v-show="!screenVisible"
           class="screen-fab"
-          :class="{ 'screen-fab-busy': screenLoading }"
-          @click="openScreen"
+          :class="{ 'screen-fab-busy': screenLoading, 'screen-fab-active': screenVisible }"
+          @click="toggleScreen"
         >
-          <el-icon><Monitor /></el-icon>
+          <el-icon><Close v-if="screenVisible" /><Monitor v-else /></el-icon>
         </button>
       </el-tooltip>
 
@@ -189,7 +189,8 @@ import {
   Lock,
   ChatDotRound,
   Postcard,
-  Monitor
+  Monitor,
+  Close
 } from '@element-plus/icons-vue'
 
 const router = useRouter()
@@ -312,10 +313,11 @@ const screenStale = ref(false)
 const screenLoggedIn = ref(false)
 const screenTakenAt = ref('')
 const screenSize = ref({ w: 460, h: 380 })
-// 初始位置：贴着右下角，留出 24px 边距
+// 初始位置：贴着右下角，但底部要给那颗圆按钮留一条出来 —— 浮窗压住按钮的话
+// 就没法「再点一次收起」了（按钮 z-index 也高一层做兜底）
 const screenPos = ref({
   x: Math.max(12, window.innerWidth - 460 - 24),
-  y: Math.max(12, window.innerHeight - 380 - 24)
+  y: Math.max(12, window.innerHeight - 380 - 86)
 })
 let screenDrag = null
 
@@ -375,6 +377,15 @@ const openScreen = () => {
 
 const closeScreen = () => {
   screenVisible.value = false
+}
+
+// 圆按钮是个开关：点一下截一张并打开，再点一下收起（不用去够浮窗里那个「关闭」）
+const toggleScreen = () => {
+  if (screenVisible.value) {
+    closeScreen()
+  } else {
+    openScreen()
+  }
 }
 
 const refreshScreen = () => {
@@ -644,7 +655,8 @@ const startScreenDrag = (event) => {
   position: fixed;
   right: 24px;
   bottom: 24px;
-  z-index: 2100;
+  /* 比浮窗（2100）高一层：浮窗万一被拖到按钮上，按钮仍然点得到（点一下就能收起） */
+  z-index: 2200;
   width: 48px;
   height: 48px;
   border: none;
@@ -663,6 +675,16 @@ const startScreenDrag = (event) => {
 .screen-fab:hover {
   transform: translateY(-2px);
   box-shadow: 0 8px 22px rgba(64, 158, 255, 0.45);
+}
+
+/* 浮窗已经打开：按钮转成灰底「收起」态，和图标一起表示再点一下就关 */
+.screen-fab-active {
+  background: #909399;
+  box-shadow: 0 6px 18px rgba(144, 147, 153, 0.35);
+}
+
+.screen-fab-active:hover {
+  box-shadow: 0 8px 22px rgba(144, 147, 153, 0.45);
 }
 
 /* 取画面中：按钮轻微呼吸，提示「正在连」 */
