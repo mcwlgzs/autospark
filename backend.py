@@ -5953,6 +5953,65 @@ def GetScrlk(authorization: str = Header(None)):
         return {'code': 400, 'data': f'截图错误:{e}'}
 
 
+@app.get('/Api/Browser/Screen')  # 悬浮窗的实时浏览器画面
+@serialized(wait=0.4, cache='screen')
+def BrowserScreen(quality: int = 55, authorization: str = Header(None)):
+    """面板右下角悬浮窗用的「看浏览器在干什么」画面。
+
+    为什么不复用 /Api/GetScrlk：那个走 WebDriver 的整窗 PNG（1400x3200），
+    一帧几 MB，按秒轮询会把浏览器线程和前端一起拖死；而且那么高的一张图
+    塞进小浮窗里等比缩完什么都看不清。这里改走 CDP 的 Page.captureScreenshot，
+    只截当前视口 + JPEG 压缩，实测一帧 5KB 左右（quality=90 也才 8.8KB）。
+
+    分辨率这件事别再折腾了（实测过）：浏览器窗口是 --window-size=1400,3200 且
+    --force-device-scale-factor=0.25，所以 CSS 视口 1368x3100、物理像素只有
+    342x775 —— 截图拿到的就是那 342x775，也就是这个窗口在屏幕上本来的样子。
+    试过 clip + scale=1、以及把 quality 提到 90，都还是 342x775：能截的上限
+    就是窗口 surface 那么大，想更清楚只能改 build_chrome_options 里的缩放
+    （那会动到抖音页面的布局，不值当）。浮窗里等比缩放看就行。
+
+    cache='screen' 是独立的一格缓存（别和 /Api/GetScrlk 的 'shot' 共用一个键，
+    那两边的 data 一个是字符串一个是对象，忙的时候会串味）：浏览器正忙时
+    返回上一帧并带 stale=True，前端把画面压暗一点就好，不至于整个浮窗空白。
+    """
+    auth_err = require_auth(authorization)
+    if auth_err:
+        return auth_err
+    setup_guard_err = setup_guard()
+    if setup_guard_err:
+        return setup_guard_err
+    browser_err = require_browser_session()
+    if browser_err:
+        return browser_err
+    try:
+        quality = max(20, min(90, int(quality)))
+    except Exception:
+        quality = 55
+    try:
+        raw = driver.execute_cdp_cmd('Page.captureScreenshot', {
+            'format': 'jpeg',
+            'quality': quality,
+            'captureBeyondViewport': False,
+        })
+        image = raw.get('data') if isinstance(raw, dict) else None
+        if not image:
+            return {'code': 400, 'data': '截图失败：浏览器没有返回图像数据'}
+        try:
+            size = driver.execute_script('return [window.innerWidth, window.innerHeight];') or [0, 0]
+        except Exception:
+            size = [0, 0]
+        return {'code': 200, 'data': {
+            'image': image,
+            'mime': 'image/jpeg',
+            'width': int(size[0] or 0),
+            'height': int(size[1] or 0),
+            'url': (driver.current_url or '')[:300],
+            'logged_in': bool(Login_is_bool),
+        }}
+    except Exception as e:
+        return {'code': 400, 'data': f'截图失败:{e}'}
+
+
 @app.get('/Api/DieLogin')  # 取消登录
 @serialized
 def DieLogin(authorization: str = Header(None)):

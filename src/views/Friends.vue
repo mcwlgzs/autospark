@@ -170,12 +170,41 @@
             style="width: 100%"
           />
         </el-form-item>
+        <el-form-item label="内容来源">
+          <el-radio-group v-model="taskForm.source">
+            <el-radio value="text">用上面写的内容</el-radio>
+            <el-radio value="hitokoto">一言接口（每次发送现取一句）</el-radio>
+            <el-radio value="girlfriend">女朋友模式（天气问候）</el-radio>
+          </el-radio-group>
+          <div v-if="taskForm.source === 'girlfriend'" class="field-hint">
+            发送时按当时时段自动写早安/午安/晚安，带当天真实天气、农历和相识天数；
+            天气取不到时用上面的消息内容兜底（在「设置 → 女朋友模式」里配置天气接口）。
+          </div>
+          <el-button
+            v-if="taskForm.source === 'hitokoto' || taskForm.source === 'girlfriend'"
+            link
+            type="primary"
+            :loading="taskForm.source === 'girlfriend' ? girlfriendLoading : hitokotoLoading"
+            @click="taskForm.source === 'girlfriend' ? handlePreviewGirlfriend() : handlePreviewHitokoto()"
+          >
+            取一条试试
+          </el-button>
+          <div class="field-hint">
+            一言（https://v1.hitokoto.cn/?c=k，哲学分类）每次随机给一句短句并带上出处，
+            格式是『正文』—— 「来源 作者」；选它之后上面的消息内容只当兜底，
+            接口取不到时才用写下的文字。
+          </div>
+        </el-form-item>
         <el-form-item label="消息内容">
           <el-input
             v-model="taskForm.text"
             type="textarea"
             :rows="3"
-            placeholder="留空将使用每日名言"
+            :placeholder="taskForm.source === 'hitokoto'
+              ? '可留空：发送时现取一句一言，取不到才用这里的文字'
+              : (taskForm.source === 'girlfriend'
+                ? '可留空：发送时按当时时段自动写问候，天气取不到才用这里的文字'
+                : '留空 = 每天发送前现取一条名言')"
           />
         </el-form-item>
         <el-form-item label="灵签">
@@ -211,12 +240,42 @@
             style="width: 100%"
           />
         </el-form-item>
+        <el-form-item label="内容来源">
+          <el-radio-group v-model="batchTaskForm.source">
+            <el-radio value="text">用上面写的内容</el-radio>
+            <el-radio value="hitokoto">一言接口（每次发送现取一句）</el-radio>
+            <el-radio value="girlfriend">女朋友模式（天气问候）</el-radio>
+          </el-radio-group>
+          <div v-if="batchTaskForm.source === 'girlfriend'" class="field-hint">
+            对本次批量创建的每个好友都生效：发送时按当时时段自动写早安/午安/晚安，
+            带当天真实天气、农历和相识天数；天气取不到时用上面的消息内容兜底
+            （在「设置 → 女朋友模式」里配置天气接口）。
+          </div>
+          <el-button
+            v-if="batchTaskForm.source === 'hitokoto' || batchTaskForm.source === 'girlfriend'"
+            link
+            type="primary"
+            :loading="batchTaskForm.source === 'girlfriend' ? girlfriendLoading : hitokotoLoading"
+            @click="batchTaskForm.source === 'girlfriend' ? handlePreviewGirlfriend() : handlePreviewHitokoto()"
+          >
+            取一条试试
+          </el-button>
+          <div class="field-hint">
+            对本次批量创建的每个好友都生效：一言（https://v1.hitokoto.cn/?c=k，哲学分类）
+            每次随机给一句短句并带上出处，格式是『正文』—— 「来源 作者」；
+            选它之后上面的消息内容只当兜底，接口取不到时才用写下的文字。
+          </div>
+        </el-form-item>
         <el-form-item label="消息内容">
           <el-input
             v-model="batchTaskForm.text"
             type="textarea"
             :rows="3"
-            placeholder="留空将使用每日名言"
+            :placeholder="batchTaskForm.source === 'hitokoto'
+              ? '可留空：发送时现取一句一言，取不到才用这里的文字'
+              : (batchTaskForm.source === 'girlfriend'
+                ? '可留空：发送时按当时时段自动写问候，天气取不到才用这里的文字'
+                : '留空 = 每天发送前现取一条名言')"
           />
         </el-form-item>
         <el-form-item label="灵签">
@@ -277,6 +336,9 @@ const taskForm = ref({
   name: '',
   time: '',
   text: '',
+  // 内容来源：'text' = 用上面写的内容；'hitokoto' = 每次发送前现取一句一言；
+  // 'girlfriend' = 按当时时段写天气问候（写下的文字只当接口取不到时的兜底）
+  source: 'text',
   // 单条任务的灵签开关（对应后端 /Time/add 的 sign 布尔字段）
   sign: false
 })
@@ -288,6 +350,8 @@ const batchTaskLoading = ref(false)
 const batchTaskForm = ref({
   time: '',
   text: '',
+  // 同单个任务：默认「用上面写的内容」，一言/女朋友模式必须用户显式选
+  source: 'text',
   sign: false
 })
 
@@ -500,7 +564,9 @@ const openCreateTaskDialog = (friend) => {
     time: '',
     text: '',
     // 默认普通任务：灵签必须由用户显式勾选，避免误发签图
-    sign: false
+    sign: false,
+    // 同理默认「用上面写的内容」，一言/女朋友模式要用户自己选，避免静默改行为
+    source: 'text'
   }
   taskDialogVisible.value = true
 }
@@ -511,10 +577,18 @@ const handleCreateTask = async () => {
     return
   }
 
+  // 归一化来源：只有真的选了非默认来源才把 source 展开进请求体，没选时
+  // options 是空对象，请求体与加这个功能之前逐字节相同（与发送弹窗同写法）
+  const source = taskForm.value.source === 'hitokoto'
+    ? 'hitokoto'
+    : (taskForm.value.source === 'girlfriend' ? 'girlfriend' : 'text')
+  const options = source === 'text' ? {} : { source }
+
   taskLoading.value = true
   try {
     await addTask(taskForm.value.time, taskForm.value.name, taskForm.value.text || null, {
-      sign: taskForm.value.sign
+      sign: taskForm.value.sign,
+      ...options
     })
     ElMessage.success('创建成功')
     taskDialogVisible.value = false
@@ -539,7 +613,7 @@ const openBatchTaskDialog = () => {
     ElMessage.warning('请先选择好友')
     return
   }
-  batchTaskForm.value = { time: '', text: '', sign: false }
+  batchTaskForm.value = { time: '', text: '', source: 'text', sign: false }
   batchTaskDialogVisible.value = true
 }
 
@@ -549,6 +623,13 @@ const handleBatchCreateTask = async () => {
     return
   }
 
+  // 来源对本次批量创建的每个好友都生效：循环里每条任务带同一个 source；
+  // 选默认「用上面写的内容」时 options 为空对象，请求体与改动前逐字节相同
+  const source = batchTaskForm.value.source === 'hitokoto'
+    ? 'hitokoto'
+    : (batchTaskForm.value.source === 'girlfriend' ? 'girlfriend' : 'text')
+  const options = source === 'text' ? {} : { source }
+
   batchTaskLoading.value = true
   let success = 0
   let failed = 0
@@ -556,7 +637,8 @@ const handleBatchCreateTask = async () => {
     for (const friend of selectedFriends.value) {
       try {
         await addTask(batchTaskForm.value.time, friend.name, batchTaskForm.value.text || null, {
-          sign: batchTaskForm.value.sign
+          sign: batchTaskForm.value.sign,
+          ...options
         })
         success++
       } catch {

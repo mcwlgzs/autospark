@@ -116,6 +116,54 @@
         <router-view />
       </main>
     </div>
+
+    <!-- 悬浮的浏览器截图：定时任务跑起来以后浏览器是一个独立窗口，光看面板
+         不知道它在干什么（是不是卡在验证码、是不是已经登录失效）。PC 上常驻
+         右下角一个圆按钮，点开截一张当时的画面，需要时点「重新截图」再截一张。
+         不做实时刷新（一秒一帧既费资源，人也不盯着一只看），手机上不显示。 -->
+    <template v-if="!isMobile">
+      <el-tooltip content="截一张浏览器画面" placement="left">
+        <button
+          v-show="!screenVisible"
+          class="screen-fab"
+          :class="{ 'screen-fab-busy': screenLoading }"
+          @click="openScreen"
+        >
+          <el-icon><Monitor /></el-icon>
+        </button>
+      </el-tooltip>
+
+      <section
+        v-show="screenVisible"
+        class="screen-float"
+        :style="{
+          left: screenPos.x + 'px',
+          top: screenPos.y + 'px',
+          width: screenSize.w + 'px',
+          height: screenSize.h + 'px'
+        }"
+      >
+        <header class="screen-head" @mousedown="startScreenDrag">
+          <span class="screen-title">浏览器截图</span>
+          <span class="screen-badge" :class="screenStatusClass">{{ screenStatusText }}</span>
+          <span class="screen-spacer"></span>
+          <el-button link size="small" :loading="screenLoading" @click="refreshScreen">重新截图</el-button>
+          <el-button link size="small" @click="cycleScreenSize">缩放</el-button>
+          <el-button link size="small" @click="closeScreen">关闭</el-button>
+        </header>
+        <div class="screen-body">
+          <img
+            v-if="screenSrc"
+            :src="screenSrc"
+            :class="{ 'screen-stale': screenStale }"
+            alt="浏览器画面"
+            draggable="false"
+          />
+          <div v-else class="screen-empty">{{ screenError || '正在获取画面…' }}</div>
+        </div>
+        <footer class="screen-foot" :title="screenFootText">{{ screenFootText }}</footer>
+      </section>
+    </template>
   </div>
 </template>
 
@@ -124,7 +172,7 @@ import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter, useRoute } from 'vue-router'
 import { ElMessageBox, ElTooltip } from 'element-plus'
 import { useUserStore } from '../stores/user'
-import { logout, getHome } from '../api/douyin'
+import { logout, getHome, getBrowserScreen } from '../api/douyin'
 import { browserStatus } from '../stores/browser'
 import {
   Fold,
@@ -140,7 +188,8 @@ import {
   Document,
   Lock,
   ChatDotRound,
-  Postcard
+  Postcard,
+  Monitor
 } from '@element-plus/icons-vue'
 
 const router = useRouter()
@@ -245,6 +294,131 @@ const handleCommand = (command) => {
       router.push('/login')
     }).catch(() => {})
   }
+}
+
+// ==================== 悬浮的浏览器截图 ====================
+// 定时任务/手动发送时浏览器是一个独立的窗口，面板上看不到它在做什么：卡在验证码、
+// 登录失效、还是根本没动，都只能靠猜。这里做一个常驻右下角的小浮窗：点开时截一张，
+// 需要时点「重新截图」再截一张（不做实时轮询 —— 一秒一帧对后端和浏览器都是白耗）。
+// 截图走 /Api/Browser/Screen（CDP JPEG，实测一帧 5KB 上下），比 /Api/GetScrlk
+// 的整窗 PNG 小三个数量级。浏览器正忙时后端会回上一帧并带 stale，画面压暗一点
+// 并在脚注写明「上一帧」，比整块空白强。
+const screenVisible = ref(false)
+const screenSrc = ref('')
+const screenLoading = ref(false)
+const screenError = ref('')
+const screenUrl = ref('')
+const screenStale = ref(false)
+const screenLoggedIn = ref(false)
+const screenTakenAt = ref('')
+const screenSize = ref({ w: 460, h: 380 })
+// 初始位置：贴着右下角，留出 24px 边距
+const screenPos = ref({
+  x: Math.max(12, window.innerWidth - 460 - 24),
+  y: Math.max(12, window.innerHeight - 380 - 24)
+})
+let screenDrag = null
+
+const SCREEN_SIZES = [
+  { w: 460, h: 380 },
+  { w: 760, h: 600 },
+  { w: 1180, h: 820 }
+]
+
+const screenStatusText = computed(() => {
+  if (screenError.value) return '不可用'
+  if (!screenSrc.value) return '连接中'
+  return screenLoggedIn.value ? '已登录' : '未登录'
+})
+
+const screenStatusClass = computed(() => {
+  if (screenError.value) return 'screen-badge-bad'
+  return screenLoggedIn.value ? 'screen-badge-ok' : 'screen-badge-warn'
+})
+
+const screenFootText = computed(() => {
+  const parts = []
+  if (screenStale.value) parts.push('上一帧（浏览器正忙）')
+  if (screenTakenAt.value) parts.push(screenTakenAt.value)
+  parts.push(screenUrl.value || '—')
+  return parts.join(' · ')
+})
+
+const fetchScreen = async () => {
+  if (screenLoading.value) return
+  screenLoading.value = true
+  try {
+    const res = await getBrowserScreen()
+    const detail = res?.data
+    if (detail && typeof detail === 'object' && detail.image) {
+      screenSrc.value = `data:${detail.mime || 'image/jpeg'};base64,${detail.image}`
+      screenUrl.value = detail.url || ''
+      screenLoggedIn.value = !!detail.logged_in
+      screenStale.value = !!res?.stale
+      screenTakenAt.value = new Date().toLocaleTimeString('zh-CN', { hour12: false })
+      screenError.value = ''
+    } else {
+      // 后端在这里回的都是字符串（浏览器未初始化 / 正忙 409 / 截图失败）
+      screenError.value = (typeof detail === 'string' && detail) || '取不到浏览器画面'
+    }
+  } catch (error) {
+    screenError.value = error?.message || '取不到浏览器画面'
+  } finally {
+    screenLoading.value = false
+  }
+}
+
+const openScreen = () => {
+  screenVisible.value = true
+  fetchScreen()
+}
+
+const closeScreen = () => {
+  screenVisible.value = false
+}
+
+const refreshScreen = () => {
+  fetchScreen()
+}
+
+// 三档尺寸循环：面板上一般是「瞄一眼」，需要看清验证码时再放大
+const cycleScreenSize = () => {
+  const index = SCREEN_SIZES.findIndex((item) => item.w === screenSize.value.w)
+  const next = SCREEN_SIZES[(index + 1) % SCREEN_SIZES.length]
+  screenSize.value = { ...next }
+  // 放大后可能超出右下角，拽回可视范围
+  screenPos.value = {
+    x: Math.min(screenPos.value.x, Math.max(12, window.innerWidth - next.w - 12)),
+    y: Math.min(screenPos.value.y, Math.max(12, window.innerHeight - next.h - 12))
+  }
+}
+
+const onScreenDrag = (event) => {
+  if (!screenDrag) return
+  const x = event.clientX - screenDrag.dx
+  const y = event.clientY - screenDrag.dy
+  screenPos.value = {
+    // 允许往左/上拖出去一点（但标题栏必须留在屏幕里，否则拽不回来）
+    x: Math.min(Math.max(x, 160 - screenSize.value.w), window.innerWidth - 160),
+    y: Math.min(Math.max(y, 0), window.innerHeight - 48)
+  }
+}
+
+const stopScreenDrag = () => {
+  screenDrag = null
+  window.removeEventListener('mousemove', onScreenDrag)
+  window.removeEventListener('mouseup', stopScreenDrag)
+}
+
+const startScreenDrag = (event) => {
+  // 标题栏上的按钮不该触发拖动
+  if (event.target.closest && event.target.closest('button')) return
+  screenDrag = {
+    dx: event.clientX - screenPos.value.x,
+    dy: event.clientY - screenPos.value.y
+  }
+  window.addEventListener('mousemove', onScreenDrag)
+  window.addEventListener('mouseup', stopScreenDrag)
 }
 </script>
 
@@ -463,6 +637,141 @@ const handleCommand = (command) => {
 /* 默认密码提示条：贴住内容区顶部，与下方的页面卡片留出间距 */
 .default-password-alert {
   margin-bottom: 16px;
+}
+
+/* ==================== 悬浮的浏览器画面 ==================== */
+.screen-fab {
+  position: fixed;
+  right: 24px;
+  bottom: 24px;
+  z-index: 2100;
+  width: 48px;
+  height: 48px;
+  border: none;
+  border-radius: 50%;
+  background: #409eff;
+  color: #fff;
+  font-size: 22px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 6px 18px rgba(64, 158, 255, 0.35);
+  transition: transform 0.15s ease, box-shadow 0.15s ease;
+}
+
+.screen-fab:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 22px rgba(64, 158, 255, 0.45);
+}
+
+/* 取画面中：按钮轻微呼吸，提示「正在连」 */
+.screen-fab-busy {
+  animation: screen-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes screen-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.65; }
+}
+
+.screen-float {
+  position: fixed;
+  z-index: 2100;
+  display: flex;
+  flex-direction: column;
+  background: #fff;
+  border: 1px solid #e4e7ed;
+  border-radius: 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.22);
+  overflow: hidden;
+}
+
+.screen-head {
+  flex: 0 0 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 6px 0 12px;
+  background: #f5f7fa;
+  border-bottom: 1px solid #e4e7ed;
+  cursor: move;
+  user-select: none;
+}
+
+.screen-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #303133;
+}
+
+.screen-spacer {
+  flex: 1;
+}
+
+.screen-badge {
+  font-size: 11px;
+  line-height: 16px;
+  padding: 1px 6px;
+  border-radius: 8px;
+}
+
+.screen-badge-ok {
+  color: #529b2e;
+  background: #e1f3d8;
+}
+
+.screen-badge-warn {
+  color: #b88230;
+  background: #faecd8;
+}
+
+.screen-badge-bad {
+  color: #c45656;
+  background: #fde2e2;
+}
+
+.screen-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: #1f1f1f;
+}
+
+.screen-body img {
+  max-width: 100%;
+  max-height: 100%;
+  object-fit: contain;
+  transition: opacity 0.2s ease;
+}
+
+/* 浏览器正忙时后端回的是上一帧（stale），压暗一点提醒「这不是最新的」 */
+.screen-stale {
+  opacity: 0.55;
+}
+
+.screen-empty {
+  padding: 16px;
+  font-size: 13px;
+  line-height: 1.6;
+  color: #c0c4cc;
+  text-align: center;
+}
+
+.screen-foot {
+  flex: 0 0 24px;
+  padding: 0 10px;
+  font-size: 11px;
+  line-height: 24px;
+  color: #909399;
+  background: #fafafa;
+  border-top: 1px solid #ebeef5;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* 响应式适配 */

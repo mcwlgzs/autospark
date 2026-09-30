@@ -120,6 +120,10 @@ export const pnglogin = () => api.get('/Api/Pnglogin')
 // 获取浏览器页面截图
 export const getScrlk = () => api.get('/Api/GetScrlk')
 
+// 悬浮窗的实时浏览器画面（JPEG，比 getScrlk 的整窗 PNG 小得多，适合按秒轮询）
+export const getBrowserScreen = (params = {}) =>
+  api.get('/Api/Browser/Screen', { params, timeout: 20000 })
+
 // Gzip压缩后base64编码
 const encodeGzipBase64 = async (str) => {
   const bytes = new TextEncoder().encode(str)
