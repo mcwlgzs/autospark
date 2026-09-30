@@ -243,7 +243,30 @@ def build_chrome_options():
     options.add_argument('--disable-dev-shm-usage')
     options.add_argument('--start-maximized')
     options.add_argument("--force-device-scale-factor=0.25")
+    if os.name == 'nt':
+        # 2026-09-30 定因（真机 A/B 实测）：面板以管理员身份运行时，Chrome 检测到自己被提权，
+        # 会「另起一个进程（自动补上 --do-not-de-elevate）然后让原进程退出」。chromedriver 监视
+        # 的正是那个退出的原进程，于是报 `session not created: Chrome instance exited` —— 而
+        # 新起的 Chrome 其实活得好好的（12 个进程），既不接 chromedriver、也不写
+        # DevToolsActivePort。同一个 profile 换普通权限启动就一切正常，所以不是 profile 脏、
+        # 也不是任何启动开关的问题（六种参数组合逐个试过，全部 2.2~2.4 秒同一句失败）。
+        # 直接告诉 Chrome 不要做这个「降权重启」，driver 就能拿到 session：实测不加 → 2.7 秒
+        # 失败；加了 → 6.7 秒成功、browserVersion 153.0.8010.54。
+        # 注意：这一条会让浏览器跟着后端一起保持提权状态，好在上面已经传了 --no-sandbox
+        # （提权下 Chrome 必须有它才能启动）。更稳妥的用法仍是用普通权限启动面板。
+        options.add_argument('--do-not-de-elevate')
     return options
+
+
+def _running_elevated():
+    """Windows 上当前进程是否以管理员身份运行（只用于给日志加一句提示）。"""
+    if os.name != 'nt':
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------- 反检测
@@ -5024,6 +5047,11 @@ def ensure_browser_ready():
             # 两端都清一遍残留进程与 profile 锁文件。Windows 上这一步以前是整段跳过的，
             # 于是「上次被强杀留下的 Chrome 占着 profile」直接把新会话顶死。
             cleanup_stale_browser_processes()
+            if os.name == 'nt' and _running_elevated():
+                log_event('warn', '浏览器',
+                          '后端当前以管理员身份运行：已给 Chrome 加 --do-not-de-elevate，'
+                          '绕过「提权后自动重启」导致的 session not created；'
+                          '更稳妥的做法仍是用普通权限启动面板')
             options = build_chrome_options()
             driver = None
             for attempt in (1, 2):

@@ -75,13 +75,18 @@ def _install_stubs():
 
     class _Options:
         def __init__(self, *a, **k):
-            pass
+            # 记下参数与实验选项：build_chrome_options() 的产物要被断言（例如
+            # Windows 上的 --do-not-de-elevate），纯空实现就只能看源码猜了。
+            self.arguments = []
+            self.experimental_options = {}
 
         def add_argument(self, *a, **k):
-            pass
+            for value in a:
+                self.arguments.append(value)
 
         def add_experimental_option(self, *a, **k):
-            pass
+            if len(a) >= 2:
+                self.experimental_options[a[0]] = a[1]
 
     class _Chrome:
         def __init__(self, *a, **k):
@@ -3340,6 +3345,22 @@ class BrowserStartupRecoveryTestCase(unittest.TestCase):
         self.assertEqual(len(cleaned), 2, '进启动路径时清一次、重试前再清一次')
         self.assertTrue(backend.init)
         self.assertIsNotNone(backend.driver)
+
+    def test_windows_chrome_options_disable_the_elevation_relaunch(self):
+        """2026-09-30：面板以管理员身份运行时，Chrome 会「另起一个进程再让原进程退出」，
+        chromedriver 监视的是退出的那个，于是报 session not created: Chrome instance
+        exited。真机 A/B：不加 --do-not-de-elevate → 2.7 秒失败；加了 → 6.7 秒成功。"""
+        arguments = backend.build_chrome_options().arguments
+        if os.name == 'nt':
+            self.assertIn('--do-not-de-elevate', arguments)
+        self.assertIsInstance(backend._running_elevated(), bool)
+
+    def test_the_elevation_relaunch_reason_is_written_down(self):
+        """这条坑太容易复发：注释里必须写明「提权 → Chrome 自己重启 → 原进程退出」。"""
+        source = open(backend.__file__, 'r', encoding='utf-8').read()
+        self.assertIn("options.add_argument('--do-not-de-elevate')", source)
+        self.assertIn('提权', source)
+        self.assertIn('Chrome instance exited', source)
 
 
 if __name__ == '__main__':
