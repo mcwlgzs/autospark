@@ -20,3 +20,17 @@ logs/
 *.bak
 *.bak-*
 *.broken.bak
+
+# 部署脚本生成的中间产物：配置模板与环境变量文件，随时可以重新生成
+deploy/generated/
+deploy/baota-env.sh
+
+# 本地工具与测试缓存
+.claude/
+.pytest_cache/
+
+# v3 多用户时期留下的数据库文件：单用户版用的是 data/state.json，这些不用跟着仓库走
+*.db
+
+# 只在本机做对比参考的第三方闭源项目（douyin_huohua）：不随仓库分发
+douyin_huohua/

@@ -102,6 +102,17 @@ def push(url, title, content, timeout=8, allow_private=False):
         with opener.open(request, timeout=timeout) as response:
             body = response.read().decode('utf-8', 'replace')
             status = response.status
+    except urllib.error.HTTPError as exc:
+        # urllib 对 4xx/5xx 直接抛 HTTPError（根本走不到下面的 status != 200 分支），
+        # 不单独处理的话用户只会看到「请求失败: HTTP Error 500: Internal Server Error」——
+        # 英文原文，而且对面返回的说明（往往写着 token 不对 / 参数缺失）全被丢掉了。
+        try:
+            detail = exc.read().decode('utf-8', 'replace').strip()
+        except Exception:
+            detail = ''
+        if exc.code in (301, 302, 303, 307, 308):
+            return False, '请求失败: 推送地址跳转到其他地址（HTTP %s），出于安全考虑不会跟随' % exc.code
+        return False, '接口返回 HTTP %s%s' % (exc.code, ('：%s' % detail[:200]) if detail else '')
     except Exception as exc:
         return False, '请求失败: %s' % exc
     if status != 200:
@@ -109,6 +120,11 @@ def push(url, title, content, timeout=8, allow_private=False):
     try:
         data = json.loads(body)
     except Exception:
+        return True, '已发送'
+    if not isinstance(data, dict):
+        # 合法 JSON 但不是对象（[]、123、"ok"）：旧代码直接 data.get 会抛 AttributeError，
+        # 在 /Api/Notify/Test 里变成 HTTP 500，在 notify() 的通知线程里更是静默死掉、
+        # 连一条失败日志都没有。这里跟「响应不是 JSON」一视同仁：HTTP 200 就算送达。
         return True, '已发送'
     error_code = data.get('error_code', data.get('code', 0))
     if str(error_code) in ('0', '200', 'None'):

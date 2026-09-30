@@ -5,6 +5,12 @@ import Components from 'unplugin-vue-components/vite'
 import { ElementPlusResolver } from 'unplugin-vue-components/resolvers'
 import path from 'path'
 
+// 开发时后端地址。默认 9844（start-backend.ps1 / start-backend.sh 的默认端口）。
+// 需要对着另一个后端调试时（例如用隔离数据目录起的第二个实例），
+// 用 SPARK_DEV_API=http://127.0.0.1:9850 npm run dev -- --port 5174 指过去，
+// 不必改这个文件。
+const DEV_API = process.env.SPARK_DEV_API || 'http://localhost:9844'
+
 export default defineConfig({
   plugins: [
     vue(),
@@ -25,10 +31,19 @@ export default defineConfig({
   server: {
     port: 5173,
     proxy: {
+      // 前端 axios 的 baseURL 是 '/api'，所以后端真实的 /Api/*、/Time/* 到了这里
+      // 变成了 /api/Api/*、/api/Time/*，必须把 '/api' 前缀剥掉再转发。
       '/api': {
-        target: 'http://localhost:9844',
+        target: DEV_API,
         changeOrigin: true,
         rewrite: (path) => path.replace(/^\/api/, '')
+      },
+      // /healthz 不走 /api（Home.vue 直接 fetch('/healthz') 取版本号），
+      // 路径和后端一致，所以不能 rewrite —— 少了这一段开发时那个版本号永远是空的。
+      // nginx 那边对应的是一条 `location = /healthz`，两边保持一致。
+      '/healthz': {
+        target: DEV_API,
+        changeOrigin: true
       }
     }
   },

@@ -14,7 +14,7 @@
    完全没有显示环境时，后端会直接回 `初始化失败: 未找到可用的 DISPLAY/Xvfb 环境`。
 3. **三个目录是全部身家**，删了就要重新扫码：
    - `data/` —— `state.json`（登录 cookie、任务、发送记账）
-   - `logs/` —— `app.log`、`backend.log`、`shots/`（失败截图）
+   - `logs/` —— `app.log`（面板「信息日志」读的就是它）、`shots/`（发送失败时的截图）
    - `chrome-profile/` —— Chrome 用户目录（登录态主要在这里）
 
    备份/迁移把这三个目录打包带走即可；反过来，**不要**把 `chrome-profile/`
@@ -221,6 +221,15 @@ ssh -L 9844:127.0.0.1:9844 user@server
 里面有完整步骤：系统依赖、Python 解释器怎么指向面板装的那份
 （`SPARK_PYTHON`）、用「进程守护管理器」常驻、宝塔站点的 nginx 反代配置
 （含必须剥掉 `/api` 前缀这个必踩的坑）、HTTPS、备份与验收清单。
+
+能自动化的部分都写在 [`baota-install.sh`](./baota-install.sh) 里了（幂等，可重复执行）：
+
+```bash
+sudo bash deploy/baota-install.sh --dry-run   # 先看计划，什么都不改
+sudo bash deploy/baota-install.sh             # 装系统依赖 / Chrome / .venv / dist / 守护配置
+```
+
+它跑完会列出**还剩哪些要你在面板里点**（建站、SSL、开机自启）。
 
 要点先放在这里：
 

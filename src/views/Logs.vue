@@ -11,6 +11,12 @@
               inline-prompt
               style="margin-right: 12px"
             />
+            <el-button
+              :icon="CopyDocument"
+              @click="handleCopyErrors"
+            >
+              复制全部错误<template v-if="errorCount > 0">（{{ errorCount }}）</template>
+            </el-button>
             <el-button :icon="Refresh" @click="loadLogs" :loading="loading">
               刷新
             </el-button>
@@ -76,11 +82,24 @@
           </template>
         </el-table-column>
         <el-table-column prop="category" label="分类" width="100" />
-        <el-table-column prop="message" label="内容" min-width="280" show-overflow-tooltip />
+        <el-table-column prop="message" label="内容" min-width="280" :show-overflow-tooltip="cellTooltip" />
         <el-table-column label="详情" min-width="200">
           <template #default="{ row }">
             <span v-if="row.detail" class="detail-text" :title="row.detail">{{ row.detail }}</span>
             <span v-else class="muted">-</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="90" fixed="right">
+          <template #default="{ row }">
+            <el-button
+              type="primary"
+              link
+              size="small"
+              :icon="CopyDocument"
+              @click="handleCopyRow(row)"
+            >
+              复制
+            </el-button>
           </template>
         </el-table-column>
       </el-table>
@@ -102,10 +121,14 @@
 </template>
 
 <script setup>
-import { ref, reactive, onMounted, onUnmounted, watch } from 'vue'
+import { ref, reactive, computed, onMounted, onUnmounted, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Refresh, Delete, Search } from '@element-plus/icons-vue'
+import { Refresh, Delete, Search, CopyDocument } from '@element-plus/icons-vue'
 import { getLogs, clearLogs, fallbackError } from '../api/douyin'
+
+// 表格单元格的悬浮提示配置：交给全局样式 .spark-cell-tip 收成一个固定大小的小框
+// （日志内容里经常夹着一整段 JSON，默认提示框会横着铺满屏幕）。
+const cellTooltip = { popperClass: 'spark-cell-tip', showArrow: false, enterable: true }
 
 const logs = ref([])
 const categories = ref([])
@@ -135,6 +158,64 @@ const levelType = (level) => (LEVEL_STYLE[level] || LEVEL_STYLE.info).type
 const levelText = (level) => (LEVEL_STYLE[level] || LEVEL_STYLE.info).text
 
 const rowClass = ({ row }) => (row.level === 'error' ? 'row-error' : '')
+
+// ===== 复制 =====
+// 当前列表里的失败日志（级别取值见后端 APP_LOG_LEVELS：success/info/warn/error）
+const errorLogs = computed(() => logs.value.filter((row) => row.level === 'error'))
+const errorCount = computed(() => errorLogs.value.length)
+
+// 单条日志的纯文本格式：[时间] [级别] [来源] 内容；有 detail 时另起一行原文
+const formatLog = (row) => {
+  const head = `[${row.time || '-'}] [${levelText(row.level)}] [${row.category || '-'}] ${row.message || ''}`
+  return row.detail ? `${head}\n${row.detail}` : head
+}
+
+// 优先 Clipboard API；http://非 localhost 等不满足安全上下文时 navigator.clipboard
+// 不存在或直接抛错，再用临时 textarea + execCommand 兜底
+const writeClipboard = async (text) => {
+  if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+    try {
+      await navigator.clipboard.writeText(text)
+      return true
+    } catch (e) {
+      // 落到下面的兜底方案
+    }
+  }
+  try {
+    const textarea = document.createElement('textarea')
+    textarea.value = text
+    textarea.setAttribute('readonly', '')
+    textarea.style.position = 'fixed'
+    textarea.style.top = '-9999px'
+    textarea.style.left = '-9999px'
+    document.body.appendChild(textarea)
+    textarea.focus()
+    textarea.select()
+    textarea.setSelectionRange(0, textarea.value.length)
+    const ok = document.execCommand('copy')
+    document.body.removeChild(textarea)
+    return ok
+  } catch (e) {
+    return false
+  }
+}
+
+const handleCopyRow = async (row) => {
+  const ok = await writeClipboard(formatLog(row))
+  if (ok) ElMessage.success('已复制')
+  else ElMessage.error('复制失败，请手动选择文本复制')
+}
+
+const handleCopyErrors = async () => {
+  const rows = errorLogs.value
+  if (!rows.length) {
+    ElMessage.info('当前没有错误日志')
+    return
+  }
+  const ok = await writeClipboard(rows.map(formatLog).join('\n\n'))
+  if (ok) ElMessage.success(`已复制 ${rows.length} 条错误日志`)
+  else ElMessage.error('复制失败，请手动选择文本复制')
+}
 
 let timer = null
 

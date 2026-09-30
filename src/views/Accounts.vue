@@ -1,546 +1,271 @@
 <template>
-  <div class="accounts-container">
-    <el-card class="header-card">
-      <div class="header">
-        <h2>抖音账号管理</h2>
-        <el-button type="primary" @click="showAddDialog">
-          <el-icon><Plus /></el-icon>
-          添加账号
-        </el-button>
-      </div>
-    </el-card>
-
-    <!-- 账号列表 -->
-    <el-card v-loading="loading" class="accounts-card">
-      <el-empty v-if="accounts.length === 0" description="暂无账号，请添加抖音账号">
-        <el-button type="primary" @click="showAddDialog">立即添加</el-button>
-      </el-empty>
-
-      <div v-else class="accounts-grid">
-        <el-card
-          v-for="account in accounts"
-          :key="account.id"
-          :class="['account-item', { 'default-account': account.is_default }]"
-          shadow="hover"
-        >
-          <div class="account-header">
-            <el-avatar :size="60" :src="account.avatar || defaultAvatar" />
-            <div class="account-info">
-              <div class="nickname">
-                {{ account.nickname || '未命名账号' }}
-                <el-tag v-if="account.is_default" type="success" size="small">默认</el-tag>
-                <el-tag v-if="account.status === 0" type="danger" size="small">已禁用</el-tag>
-              </div>
-              <div class="account-meta">
-                <span v-if="account.unique_id">@{{ account.unique_id }}</span>
-                <span v-else class="text-muted">未设置抖音号</span>
-              </div>
-              <div class="cookie-status">
-                <el-tag
-                  :type="getCookieStatusType(account.cookie_status)"
-                  size="small"
-                  effect="plain"
-                >
-                  {{ getCookieStatusText(account.cookie_status) }}
-                </el-tag>
-                <span v-if="account.cookie_expire" class="expire-time">
-                  过期时间: {{ formatTime(account.cookie_expire) }}
-                </span>
-              </div>
-            </div>
+  <div class="account-container">
+    <el-card>
+      <template #header>
+        <div class="card-header">
+          <div class="card-title">
+            <span>抖音账号</span>
+            <el-tag :type="cookieTagType" effect="plain" size="small">{{ cookieText }}</el-tag>
           </div>
-
-          <div class="account-stats">
-            <div class="stat-item">
-              <div class="stat-value">{{ account.task_count || 0 }}</div>
-              <div class="stat-label">关联任务</div>
-            </div>
-            <div class="stat-item">
-              <div class="stat-value">{{ account.friend_count || 0 }}</div>
-              <div class="stat-label">好友数量</div>
-            </div>
-          </div>
-
-          <div class="account-actions">
-            <el-button
-              v-if="!account.is_default"
-              size="small"
-              @click="setDefault(account.id)"
-            >
-              设为默认
-            </el-button>
-            <el-button size="small" @click="showEditDialog(account)">
-              编辑
-            </el-button>
-            <el-button
-              size="small"
-              type="primary"
-              @click="loginAccount(account.id)"
-            >
-              重新登录
-            </el-button>
-            <el-button
-              v-if="accounts.length > 1"
-              size="small"
-              type="danger"
-              @click="deleteAccount(account.id)"
-            >
-              删除
-            </el-button>
-          </div>
-
-          <div v-if="account.remark" class="account-remark">
-            <el-icon><Document /></el-icon>
-            {{ account.remark }}
-          </div>
-        </el-card>
-      </div>
-    </el-card>
-
-    <!-- 添加/编辑对话框 -->
-    <el-dialog
-      v-model="dialogVisible"
-      :title="dialogTitle"
-      width="500px"
-      @close="resetForm"
-    >
-      <el-form
-        ref="formRef"
-        :model="form"
-        :rules="rules"
-        label-width="100px"
-      >
-        <el-form-item label="账号昵称" prop="nickname">
-          <el-input v-model="form.nickname" placeholder="请输入账号昵称" />
-        </el-form-item>
-
-        <el-form-item label="抖音号" prop="unique_id">
-          <el-input v-model="form.unique_id" placeholder="请输入抖音号（可选）" />
-        </el-form-item>
-
-        <el-form-item label="备注">
-          <el-input
-            v-model="form.remark"
-            type="textarea"
-            :rows="3"
-            placeholder="请输入备注信息（可选）"
-          />
-        </el-form-item>
-
-        <el-form-item label="设为默认">
-          <el-switch v-model="form.is_default" />
-        </el-form-item>
-
-        <el-form-item label="状态">
-          <el-radio-group v-model="form.status">
-            <el-radio :label="1">启用</el-radio>
-            <el-radio :label="0">禁用</el-radio>
-          </el-radio-group>
-        </el-form-item>
-      </el-form>
-
-      <template #footer>
-        <el-button @click="dialogVisible = false">取消</el-button>
-        <el-button type="primary" @click="submitForm">确定</el-button>
+          <el-button :icon="Refresh" circle :loading="loading" title="刷新" @click="load" />
+        </div>
       </template>
-    </el-dialog>
 
-    <!-- 登录对话框 -->
-    <el-dialog
-      v-model="loginDialogVisible"
-      title="账号登录"
-      width="600px"
-    >
-      <div class="login-tips">
-        <el-alert
-          type="info"
-          :closable="false"
-          show-icon
-        >
-          <p>请按照以下步骤完成登录：</p>
-          <ol>
-            <li>点击「初始化浏览器」按钮</li>
-            <li>在弹出的浏览器中扫码登录抖音</li>
-            <li>登录成功后点击「确认登录」</li>
-          </ol>
-        </el-alert>
-      </div>
+      <el-alert
+        v-if="info && !info.logged_in"
+        class="tip"
+        type="warning"
+        :closable="false"
+        show-icon
+        title="抖音未登录：这里的状态来自真实浏览器，登录后才会出现 Cookie 与到期时间。"
+        description="到「设置」页扫码登录，或点「初始化浏览器」唤起登录窗口。"
+      />
 
-      <div class="login-actions">
-        <el-button type="primary" @click="initBrowser" :loading="browserInitializing">
-          初始化浏览器
-        </el-button>
-        <el-button type="success" @click="confirmLogin" :disabled="!browserInitialized">
-          确认登录
-        </el-button>
-      </div>
-    </el-dialog>
+      <el-table v-loading="loading" :data="rows" stripe style="width: 100%">
+        <el-table-column label="账号" min-width="180">
+          <template #default="{ row }">
+            <div class="account-name">
+              <span :class="{ muted: !row.nickname }">{{ row.nickname || '当前登录的抖音账号' }}</span>
+              <el-tag :type="row.logged_in ? 'success' : 'info'" effect="light" size="small">
+                {{ row.logged_in ? '已登录' : '未登录' }}
+              </el-tag>
+            </div>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="Cookie 状态" width="150">
+          <template #default="{ row }">
+            <el-tag :type="tagTypeOf(row.cookie_status)" effect="light" size="small">
+              {{ row.cookie_text }}
+            </el-tag>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="好友数" width="110">
+          <template #default="{ row }">
+            <template v-if="row.friend_count_known">
+              {{ row.friend_count }} 位
+            </template>
+            <el-tooltip v-else content="好友数只读内存里已抓到的列表，不会为刷新一个数字去开一次好友列表。到「好友列表」页刷新一次即可。" placement="top">
+              <span class="muted">未获取</span>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="今日已发" width="110">
+          <template #default="{ row }">
+            <span :class="{ muted: !row.sent_today }">{{ row.sent_today }} 条</span>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="Cookie 到期" width="190">
+          <template #default="{ row }">
+            <div v-if="row.cookie_expire">
+              <div>{{ row.cookie_expire }}</div>
+              <div class="sub" :class="{ warn: row.cookie_ahead_hours !== null && row.cookie_ahead_hours < 24 }">
+                {{ aheadText(row.cookie_ahead_hours) }}
+              </div>
+            </div>
+            <el-tooltip v-else content="抖音没有给凭证写到期时间（由服务端控制），真失效时后端会暂停发送并记日志。" placement="top">
+              <span class="muted">—</span>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="备注" min-width="160" :show-overflow-tooltip="cellTooltip">
+          <template #default="{ row }">
+            <span :class="{ muted: !row.note }">{{ row.note || '未填写' }}</span>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="添加时间" width="180">
+          <template #default="{ row }">
+            <el-tooltip v-if="row.added_at" content="面板第一次确认真实登录成功的时间，不是文件创建时间。" placement="top">
+              <span>{{ row.added_at }}</span>
+            </el-tooltip>
+            <span v-else class="muted">—</span>
+          </template>
+        </el-table-column>
+
+        <el-table-column label="操作" width="110" fixed="right">
+          <template #default>
+            <el-button link type="primary" @click="editNote">编辑备注</el-button>
+          </template>
+        </el-table-column>
+
+        <template #empty>
+          <el-empty :description="loading ? '正在读取…' : '没有读到账号信息'" />
+        </template>
+      </el-table>
+
+      <div class="group-title">运行概况</div>
+      <el-descriptions :column="2" border size="small">
+        <el-descriptions-item label="自动化引擎">{{ facts.engine || '—' }}</el-descriptions-item>
+        <el-descriptions-item label="反检测注入">
+          {{ facts.stealth_injected ? '已注入' : '未注入' }}
+        </el-descriptions-item>
+        <el-descriptions-item label="登录凭证">
+          {{ facts.cookie_count ? facts.cookie_count + ' 个 Cookie' : '无' }}
+          <span v-if="facts.cookie_names && facts.cookie_names.length" class="sub">
+            （{{ facts.cookie_names.join('、') }}）
+          </span>
+        </el-descriptions-item>
+        <el-descriptions-item label="登录态目录">{{ facts.profile_dir || '—' }}</el-descriptions-item>
+      </el-descriptions>
+
+      <p class="footnote">
+        本程序是单用户版：只登录一个抖音账号，就是这里显示的这一个（登录态存在
+        <code>chrome-profile/</code> 目录里，重启后端会自动恢复）。所以这里只有一行，
+        没有「添加账号 / 删除账号」这一类操作 —— 要换账号就用下面的登录区退出登录后重新扫码。
+        备注和添加时间存在本地 <code>data/state.json</code>，Cookie 状态、好友数、今日已发都是实时读出来的。
+      </p>
+    </el-card>
+
+    <DouyinLogin />
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Plus, Document } from '@element-plus/icons-vue'
-import {
-  getAccountsList,
-  createAccount,
-  updateAccount,
-  deleteAccountApi,
-  setDefaultAccount,
-  initBrowser,
-  getLoginStatus
-} from '../api/douyin'
+import { Refresh } from '@element-plus/icons-vue'
+import { getAccountInfo, setAccountNote, fallbackError } from '../api/douyin'
+import DouyinLogin from '../components/DouyinLogin.vue'
+
+// 表格单元格的悬浮提示配置：交给全局样式 .spark-cell-tip 收成一个固定大小的小框。
+const cellTooltip = { popperClass: 'spark-cell-tip', showArrow: false, enterable: true }
 
 const loading = ref(false)
-const accounts = ref([])
-const dialogVisible = ref(false)
-const dialogTitle = ref('添加账号')
-const formRef = ref(null)
-const editingId = ref(null)
-const defaultAvatar = 'https://via.placeholder.com/60'
+const info = ref(null)
 
-// 登录相关
-const loginDialogVisible = ref(false)
-const browserInitializing = ref(false)
-const browserInitialized = ref(false)
-const currentLoginAccountId = ref(null)
+const rows = computed(() => (info.value ? [info.value] : []))
+const facts = computed(() => info.value || {})
+const cookieText = computed(() => (info.value ? info.value.cookie_text : '读取中…'))
+const cookieTagType = computed(() => tagTypeOf(info.value ? info.value.cookie_status : 'unknown'))
 
-const form = ref({
-  nickname: '',
-  unique_id: '',
-  remark: '',
-  is_default: false,
-  status: 1
-})
-
-const rules = {
-  nickname: [
-    { required: true, message: '请输入账号昵称', trigger: 'blur' }
-  ]
+// Cookie 状态到标签颜色：只有「有效」是绿的，快到期是黄的，真出问题是红的。
+function tagTypeOf(status) {
+  if (status === 'valid') return 'success'
+  if (status === 'expiring') return 'warning'
+  if (status === 'expired' || status === 'missing') return 'danger'
+  return 'info'
 }
 
-// 加载账号列表
-const loadAccounts = async () => {
+const aheadText = (hours) => {
+  if (hours === null || hours === undefined) return ''
+  if (hours < 0) return `已过期 ${Math.abs(hours).toFixed(1)} 小时`
+  if (hours < 48) return `约 ${hours.toFixed(1)} 小时后到期`
+  return `约 ${Math.floor(hours / 24)} 天后到期`
+}
+
+const load = async () => {
   loading.value = true
   try {
-    const res = await getAccountsList()
-    accounts.value = res.data || []
+    // 拦截器返回的是响应体 {code, data}，所以读 res.code / res.data（没有 res.status）。
+    const res = await getAccountInfo()
+    if (res.code == 200) {
+      info.value = res.data || null
+    } else {
+      ElMessage.error(res.data || '读取账号信息失败')
+    }
   } catch (error) {
-    ElMessage.error('加载账号列表失败')
+    fallbackError(error, '读取账号信息失败')
   } finally {
     loading.value = false
   }
 }
 
-// 显示添加对话框
-const showAddDialog = () => {
-  dialogTitle.value = '添加账号'
-  editingId.value = null
-  dialogVisible.value = true
-}
-
-// 显示编辑对话框
-const showEditDialog = (account) => {
-  dialogTitle.value = '编辑账号'
-  editingId.value = account.id
-  form.value = {
-    nickname: account.nickname,
-    unique_id: account.unique_id || '',
-    remark: account.remark || '',
-    is_default: account.is_default === 1,
-    status: account.status
-  }
-  dialogVisible.value = true
-}
-
-// 提交表单
-const submitForm = async () => {
-  const valid = await formRef.value.validate().catch(() => false)
-  if (!valid) return
-
+const editNote = async () => {
+  const current = (info.value && info.value.note) || ''
+  const max = (info.value && info.value.note_max) || 100
   try {
-    const data = {
-      ...form.value,
-      is_default: form.value.is_default ? 1 : 0
-    }
-
-    if (editingId.value) {
-      await updateAccount(editingId.value, data)
-      ElMessage.success('更新成功')
+    const { value } = await ElMessageBox.prompt('备注只存在本地，不影响登录和发送。', '编辑账号备注', {
+      inputValue: current,
+      inputPlaceholder: `最多 ${max} 个字，留空表示不写备注`,
+      inputValidator: (text) => (text || '').length <= max || `最多 ${max} 个字`,
+      confirmButtonText: '保存',
+      cancelButtonText: '取消'
+    })
+    const res = await setAccountNote(value || '')
+    if (res.code == 200) {
+      ElMessage.success('备注已保存')
+      await load()
     } else {
-      await createAccount(data)
-      ElMessage.success('添加成功')
-    }
-
-    dialogVisible.value = false
-    loadAccounts()
-  } catch (error) {
-    ElMessage.error(editingId.value ? '更新失败' : '添加失败')
-  }
-}
-
-// 重置表单
-const resetForm = () => {
-  form.value = {
-    nickname: '',
-    unique_id: '',
-    remark: '',
-    is_default: false,
-    status: 1
-  }
-  editingId.value = null
-}
-
-// 设置默认账号
-const setDefault = async (id) => {
-  try {
-    await setDefaultAccount(id)
-    ElMessage.success('已设为默认账号')
-    loadAccounts()
-  } catch (error) {
-    ElMessage.error('设置失败')
-  }
-}
-
-// 删除账号
-const deleteAccount = async (id) => {
-  try {
-    await ElMessageBox.confirm(
-      '删除账号将同时删除该账号的所有关联数据（任务、好友等），是否继续？',
-      '警告',
-      {
-        confirmButtonText: '确定',
-        cancelButtonText: '取消',
-        type: 'warning'
-      }
-    )
-
-    await deleteAccountApi(id)
-    ElMessage.success('删除成功')
-    loadAccounts()
-  } catch (error) {
-    if (error !== 'cancel') {
-      ElMessage.error('删除失败')
-    }
-  }
-}
-
-// 登录账号
-const loginAccount = (id) => {
-  currentLoginAccountId.value = id
-  loginDialogVisible.value = true
-  browserInitialized.value = false
-}
-
-// 初始化浏览器
-const handleInitBrowser = async () => {
-  browserInitializing.value = true
-  try {
-    await initBrowser()
-    browserInitialized.value = true
-    ElMessage.success('浏览器已启动，请在浏览器中完成登录')
-  } catch (error) {
-    ElMessage.error('初始化浏览器失败')
-  } finally {
-    browserInitializing.value = false
-  }
-}
-
-// 确认登录
-const confirmLogin = async () => {
-  try {
-    const res = await getLoginStatus()
-    if (res.data && res.data.is_logged_in) {
-      // 更新账号cookie信息
-      // TODO: 调用更新账号cookie的API
-      ElMessage.success('登录成功')
-      loginDialogVisible.value = false
-      loadAccounts()
-    } else {
-      ElMessage.warning('请先在浏览器中完成登录')
+      ElMessage.error(res.data || '保存备注失败')
     }
   } catch (error) {
-    ElMessage.error('确认登录失败')
+    // 点取消不是错误，不要弹提示
+    if (error !== 'cancel' && error !== 'close') fallbackError(error, '保存备注失败')
   }
 }
 
-// Cookie状态
-const getCookieStatusType = (status) => {
-  const map = {
-    0: 'danger',
-    1: 'success',
-    2: 'warning'
-  }
-  return map[status] || 'info'
-}
-
-const getCookieStatusText = (status) => {
-  const map = {
-    0: '无效',
-    1: '有效',
-    2: '待刷新'
-  }
-  return map[status] || '未知'
-}
-
-// 格式化时间
-const formatTime = (time) => {
-  if (!time) return '-'
-  const date = new Date(time)
-  return date.toLocaleString('zh-CN')
-}
-
-onMounted(() => {
-  loadAccounts()
-})
+onMounted(load)
 </script>
 
 <style scoped>
-.accounts-container {
-  padding: 20px;
+.account-container {
+  padding: 0;
 }
 
-.header-card {
-  margin-bottom: 20px;
-}
-
-.header {
+.card-header {
   display: flex;
+  align-items: center;
   justify-content: space-between;
-  align-items: center;
 }
 
-.header h2 {
-  margin: 0;
-  font-size: 20px;
-}
-
-.accounts-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(350px, 1fr));
-  gap: 20px;
-}
-
-.account-item {
-  position: relative;
-  transition: all 0.3s;
-}
-
-.account-item:hover {
-  transform: translateY(-5px);
-}
-
-.default-account {
-  border: 2px solid var(--el-color-success);
-}
-
-.account-header {
-  display: flex;
-  gap: 15px;
-  margin-bottom: 20px;
-}
-
-.account-info {
-  flex: 1;
-  min-width: 0;
-}
-
-.nickname {
-  font-size: 18px;
-  font-weight: bold;
-  margin-bottom: 5px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-}
-
-.account-meta {
-  color: #606266;
-  font-size: 14px;
-  margin-bottom: 5px;
-}
-
-.text-muted {
-  color: #909399;
-}
-
-.cookie-status {
+.card-title {
   display: flex;
   align-items: center;
   gap: 10px;
-  margin-top: 5px;
+  font-weight: 600;
 }
 
-.expire-time {
-  font-size: 12px;
-  color: #909399;
+.tip {
+  margin-bottom: 14px;
 }
 
-.account-stats {
+.account-name {
   display: flex;
-  justify-content: space-around;
-  padding: 15px 0;
-  border-top: 1px solid #eee;
-  border-bottom: 1px solid #eee;
-  margin-bottom: 15px;
-}
-
-.stat-item {
-  text-align: center;
-}
-
-.stat-value {
-  font-size: 24px;
-  font-weight: bold;
-  color: var(--el-color-primary);
-}
-
-.stat-label {
-  font-size: 12px;
-  color: #909399;
-  margin-top: 5px;
-}
-
-.account-actions {
-  display: flex;
+  align-items: center;
   gap: 8px;
-  flex-wrap: wrap;
 }
 
-.account-actions .el-button {
-  flex: 1;
-  min-width: 80px;
+.group-title {
+  margin: 18px 0 10px;
+  font-weight: 600;
+  color: #303133;
 }
 
-.account-remark {
-  margin-top: 15px;
-  padding: 10px;
+.sub {
+  color: #909399;
+  font-size: 12px;
+}
+
+.sub.warn {
+  color: #e6a23c;
+}
+
+.muted {
+  color: #c0c4cc;
+}
+
+.footnote {
+  margin: 16px 0 0;
+  color: #909399;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.footnote code {
   background: #f5f7fa;
-  border-radius: 4px;
-  font-size: 13px;
-  color: #606266;
-  display: flex;
-  align-items: center;
-  gap: 5px;
+  padding: 1px 4px;
+  border-radius: 3px;
 }
 
-.login-tips {
-  margin-bottom: 20px;
-}
-
-.login-tips ol {
-  margin: 10px 0 0 0;
-  padding-left: 20px;
-}
-
-.login-tips li {
-  margin: 5px 0;
-}
-
-.login-actions {
-  display: flex;
-  gap: 10px;
-  justify-content: center;
+@media (max-width: 768px) {
+  .card-header {
+    flex-wrap: wrap;
+    gap: 8px;
+  }
 }
 </style>

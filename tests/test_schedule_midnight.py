@@ -292,8 +292,9 @@ class InputValidationTestCase(unittest.TestCase):
         backend._register_task = self._capture_register
 
     def _capture_register(self, play_time, name, text, task_id=None, mark_today=False,
-                          sign=False):
-        self.added.append({'time': play_time, 'name': name, 'text': text, 'sign': sign})
+                          sign=False, source=None):
+        self.added.append({'time': play_time, 'name': name, 'text': text, 'sign': sign,
+                           'source': source})
         return task_id or 'fake-task-id'
 
     def tearDown(self):
@@ -338,6 +339,106 @@ class InputValidationTestCase(unittest.TestCase):
             self.assertEqual(self.added, [], '被拦截时不该建出任务')
         finally:
             backend.STATE.set('password_hash', backend.hash_password('test-password-123'))
+
+
+class NotifyConfigTestCase(unittest.TestCase):
+    """消息通知配置接口的回归测试（用户 2026-09-28 报「检查下消息通知有没有 bug」）。
+
+    这里兜住三个真机复现过的问题：
+      1. 保存本机 / 内网 webhook 时 SetNotify 没带 allow_private，环境变量
+         SPARK_ALLOW_PRIVATE_PUSH=1 根本不生效 —— 而报错文案恰恰是让用户去设这个变量，
+         本机 webhook（ntfy / Uptime Kuma / 内网脚本）永远存不进来。
+      2. 总开关开着、推送地址和邮箱都没配，接口照样返回 200：notify() 在第一道门禁就
+         静默 return False，面板上却显示「通知已开启」，真出事时一条都收不到。
+      3. 信息日志页的分类下拉 = APP_LOG_CATEGORIES，只有 8 个，而日志实际用到 19 个，
+         「通知」这一类的日志在页面上根本筛不出来。
+    """
+
+    def setUp(self):
+        backend.STATE.set('tasks', [])
+        backend.STATE.set('password_hash', backend.hash_password('test-password-123'))
+        backend.require_auth = lambda authorization=None: None
+        self._saved_notify = dict(backend._notify_config(force=True))
+        backend.STATE.set('notify', dict(backend.DEFAULT_STATE['notify']))
+        self._saved_switch = backend.ALLOW_PRIVATE_PUSH
+        backend.ALLOW_PRIVATE_PUSH = False
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        backend.ALLOW_PRIVATE_PUSH = self._saved_switch
+        backend.STATE.set('notify', self._saved_notify)
+
+    def test_private_push_url_follows_the_switch(self):
+        res = backend.SetNotify(enabled=True, url='http://127.0.0.1:9865/hook')
+        self.assertEqual(res.get('code'), 400, '默认必须拒绝本机地址：%s' % (res,))
+        self.assertIn('内网', res.get('data') or '')
+        backend.ALLOW_PRIVATE_PUSH = True
+        res = backend.SetNotify(enabled=True, url='http://127.0.0.1:9865/hook')
+        self.assertEqual(res.get('code'), 200, '开关打开后应当能存本机地址：%s' % (res,))
+        self.assertEqual(backend._notify_config()['url'], 'http://127.0.0.1:9865/hook')
+
+    def test_enabling_without_any_channel_is_rejected(self):
+        res = backend.SetNotify(enabled=True, url='')
+        self.assertEqual(res.get('code'), 400, res)
+        self.assertIn('推送地址', res.get('data') or '')
+        self.assertFalse(backend._notify_config().get('enabled'),
+                         '被拒绝时不能把总开关落盘（否则面板显示已开启却发不出通知）')
+
+    def test_enabling_with_a_saved_email_channel_is_accepted(self):
+        """拦住的是「两个通道都没有」，不是「没填推送地址」。"""
+        res = backend.SetNotify(enabled=True, url='', email={
+            'enabled': True, 'host': 'smtp.example.com', 'port': 465,
+            'username': 'me@example.com', 'password': 'secret-pass',
+            'to': 'you@example.com', 'ssl': True})
+        self.assertEqual(res.get('code'), 200, res)
+        self.assertTrue(backend._notify_config().get('enabled'))
+
+    def test_every_log_category_is_selectable(self):
+        """分类下拉取的就是 APP_LOG_CATEGORIES，必须覆盖所有字面量分类。"""
+        import ast
+        with open(backend.__file__, 'r', encoding='utf-8') as fh:
+            tree = ast.parse(fh.read())
+        used = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Name) and func.id == 'log_event'):
+                continue
+            if len(node.args) >= 2 and isinstance(node.args[1], ast.Constant) \
+                    and isinstance(node.args[1].value, str):
+                used.add(node.args[1].value)
+        self.assertTrue(used, '没扫到任何 log_event 调用，说明测试本身失效了')
+        missing = sorted(used - set(backend.APP_LOG_CATEGORIES))
+        self.assertEqual(missing, [],
+                         '这些分类在信息日志页的分类下拉里选不到：%s' % missing)
+
+    def test_notify_worker_logs_unexpected_exceptions(self):
+        """通知线程体必须兜住异常并写日志。
+
+        以前 push() 对 `[]` 这种「合法 JSON 但不是对象」的返回体会抛 AttributeError，
+        而 notify() 直接把裸函数丢进 daemon 线程：线程静默死掉、一条日志都没有，
+        用户永远不知道通知其实没发出去。
+        """
+        logged = []
+
+        def fake_log(level, category, message, detail=None):
+            logged.append({'level': level, 'category': category, 'message': message})
+
+        def boom(*args, **kwargs):
+            raise AttributeError("'list' object has no attribute 'get'")
+
+        original_log = backend.log_event
+        original_push = backend.push
+        backend.log_event = fake_log
+        backend.push = boom
+        try:
+            backend._notify_worker({'url': 'https://push.example.com/hook'}, True, False, '标题', '内容')
+        finally:
+            backend.log_event = original_log
+            backend.push = original_push
+        self.assertTrue(any(row['level'] == 'error' and '通知发送异常' in row['message']
+                            for row in logged), logged)
 
 
 if __name__ == '__main__':

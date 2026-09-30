@@ -97,8 +97,37 @@
             v-model="sendForm.text"
             type="textarea"
             :rows="4"
-            :placeholder="sendForm.wenchangSign ? '可留空，留空则用当天签文文字' : '请输入消息内容'"
+            :placeholder="sendForm.source === 'hitokoto'
+              ? '可留空：发送时现取一句一言，取不到才用这里的文字'
+              : (sendForm.source === 'girlfriend'
+                ? '可留空：发送时按当时时段自动写问候，天气取不到才用这里的文字'
+                : (sendForm.wenchangSign ? '可留空，留空则用当天签文文字' : '请输入消息内容'))"
           />
+        </el-form-item>
+        <el-form-item label="内容来源">
+          <el-radio-group v-model="sendForm.source">
+            <el-radio value="text">用上面写的内容</el-radio>
+            <el-radio value="hitokoto">一言接口（发送时现取一句）</el-radio>
+            <el-radio value="girlfriend">女朋友模式（天气问候）</el-radio>
+          </el-radio-group>
+          <div v-if="sendForm.source === 'girlfriend'" class="field-hint">
+            发送时按当时时段自动写早安/午安/晚安，带当天真实天气、农历和相识天数；
+            天气取不到时用上面的消息内容兜底（在「设置 → 女朋友模式」里配置天气接口）。
+          </div>
+          <el-button
+            v-if="sendForm.source === 'hitokoto' || sendForm.source === 'girlfriend'"
+            link
+            type="primary"
+            :loading="sendForm.source === 'girlfriend' ? girlfriendLoading : hitokotoLoading"
+            @click="sendForm.source === 'girlfriend' ? handlePreviewGirlfriend() : handlePreviewHitokoto()"
+          >
+            取一条试试
+          </el-button>
+          <div class="field-hint">
+            一言（https://v1.hitokoto.cn/?c=k，哲学分类）每次随机给一句短句并带上出处，
+            格式是『正文』—— 「来源 作者」；选它之后上面的消息内容只当兜底，
+            接口取不到时才用写下的文字。
+          </div>
         </el-form-item>
         <el-form-item label="灵签">
           <el-switch v-model="sendForm.wenchangSign" active-text="附带文昌帝君灵签图片" />
@@ -204,6 +233,10 @@
         </el-button>
       </template>
     </el-dialog>
+    <!-- 女朋友模式预览：接口返回的 text 是多行正文，用 pre-wrap 保留换行 -->
+    <el-dialog v-model="girlfriendPreviewVisible" :title="girlfriendPreviewTitle" width="560px" destroy-on-close>
+      <pre class="preview-text">{{ girlfriendPreviewText }}</pre>
+    </el-dialog>
   </div>
 </template>
 
@@ -211,7 +244,7 @@
 import { ref, computed, onMounted, onActivated } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Refresh, Search, User, ArrowDown, Tickets, Check, Close } from '@element-plus/icons-vue'
-import { sendMessage, sendWenchangSign, addTask, getFriendsList, checkSend, fallbackError } from '../api/douyin'
+import { sendMessage, sendWenchangSign, addTask, getFriendsList, checkSend, previewHitokoto, previewGirlfriend, fallbackError } from '../api/douyin'
 import { friendsList, setFriendsList } from '../stores/browser'
 
 const loading = ref(false)
@@ -230,6 +263,8 @@ const sendLoading = ref(false)
 const sendForm = ref({
   name: '',
   text: '',
+  // 正文来源：'text' = 用上面写的内容；'hitokoto' = 发送时现取一句一言（写下的只当兜底）
+  source: 'text',
   // 灵签开关：勾选后走「签图 + 签文」通道，正文允许留空
   wenchangSign: false,
   // 勾了灵签之后还能选「只发签图」：不附任何文字，用来单独验证图片这条路
@@ -335,8 +370,9 @@ const openSendDialog = (friend) => {
   sendForm.value = {
     name: friend.name,
     text: '',
+    source: 'text',
     // 每次打开都归零：弹窗虽然 destroy-on-close，但表单状态在组件里，
-    // 不重置会让「上次勾了灵签 / 上次选了只发图」顺延到下一个好友
+    // 不重置会让「上次勾了灵签 / 上次选了只发图 / 上次选了一言」顺延到下一个好友
     wenchangSign: false,
     imageOnly: false
   }
@@ -363,22 +399,84 @@ const handleCheck = async () => {
   }
 }
 
+const hitokotoLoading = ref(false)
+
+// 女朋友模式预览：多行正文用弹窗展示（不复用一言那条 ElMessage 路径）
+const girlfriendLoading = ref(false)
+const girlfriendPreviewVisible = ref(false)
+const girlfriendPreviewTitle = ref('女朋友模式预览')
+const girlfriendPreviewText = ref('')
+
+// 只取一句给用户看看，不发出去（对应后端 GET /Api/Hitokoto/Preview）
+const handlePreviewHitokoto = async () => {
+  hitokotoLoading.value = true
+  try {
+    const res = await previewHitokoto()
+    // 后端成功时返回的是 {'code':200,'data':{'text':'…'}} —— data 是**对象**不是字符串。
+    // 直接把 data 丢给 ElMessage 会弹出一个「绿色但什么都没有」的通知（用户 m02903 报的）。
+    const detail = res?.data
+    if (detail && typeof detail === 'object' && detail.text) {
+      ElMessage.success(detail.text)
+    } else {
+      ElMessage.error(typeof detail === 'string' && detail
+        ? detail
+        : '一言接口暂时取不到内容，请稍后再试')
+    }
+  } catch (error) {
+    fallbackError(error, '一言接口暂时取不到内容，请稍后再试')
+  } finally {
+    hitokotoLoading.value = false
+  }
+}
+
+// 「取一条试试」的女朋友模式分支（对应后端 GET /Api/Girlfriend/Preview?period=auto）。
+// 成功时 res.data 是对象（{period, period_text, text}），失败时是中文原因字符串。
+const handlePreviewGirlfriend = async () => {
+  girlfriendLoading.value = true
+  try {
+    const res = await previewGirlfriend('auto')
+    const detail = res?.data
+    if (detail && typeof detail === 'object' && detail.text) {
+      girlfriendPreviewTitle.value = detail.period_text
+        ? `女朋友模式预览（${detail.period_text}）`
+        : '女朋友模式预览'
+      girlfriendPreviewText.value = detail.text
+      girlfriendPreviewVisible.value = true
+    } else {
+      ElMessage.error(typeof detail === 'string' && detail
+        ? detail
+        : '女朋友模式暂时取不到内容，请稍后再试')
+    }
+  } catch (error) {
+    fallbackError(error, '女朋友模式暂时取不到内容，请稍后再试')
+  } finally {
+    girlfriendLoading.value = false
+  }
+}
+
 const handleSend = async () => {
-  // 勾了灵签就放宽正文校验：签图本身有内容，且后端会用当天签文自动补文字，
-  // 这里再拦「请输入消息内容」会让用户勾了开关却怎么都发不出去。
-  if (!sendForm.value.wenchangSign && !sendForm.value.text.trim()) {
+  // 勾了灵签、选了一言或选了女朋友模式都放宽正文校验：正文由后端补（当天签文 /
+  // 现取的一句一言 / 按当时时段写的问候），这里再拦「请输入消息内容」会让用户
+  // 选好了来源却怎么都发不出去。
+  const source = sendForm.value.source === 'hitokoto'
+    ? 'hitokoto'
+    : (sendForm.value.source === 'girlfriend' ? 'girlfriend' : 'text')
+  if (!sendForm.value.wenchangSign && source === 'text' && !sendForm.value.text.trim()) {
     ElMessage.warning('请输入消息内容')
     return
   }
 
   sendLoading.value = true
   try {
-    // 未勾选时走原来的 sendMessage(name, text)：请求体与改动前逐字节相同
+    // 只有真的选了非默认来源才展开 source：没选时 options 是空对象，
+    // 请求体与加这个功能之前逐字节相同
+    const options = source === 'text' ? {} : { source }
     const res = sendForm.value.wenchangSign
       ? await sendWenchangSign(sendForm.value.name, sendForm.value.text, {
-          image_only: sendForm.value.imageOnly
+          image_only: sendForm.value.imageOnly,
+          ...options
         })
-      : await sendMessage(sendForm.value.name, sendForm.value.text)
+      : await sendMessage(sendForm.value.name, sendForm.value.text, options)
     ElMessage.success('发送成功')
     sendDialogVisible.value = false
   } catch (error) {
@@ -523,6 +621,17 @@ const handleBatchCreateTask = async () => {
   font-size: 12px;
   line-height: 1.5;
   color: #909399;
+}
+
+/* 女朋友模式预览正文：保留接口返回的多行换行（ElMessage 会把换行挤成一行） */
+.preview-text {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.8;
+  color: #303133;
 }
 
 /* 响应式适配 */

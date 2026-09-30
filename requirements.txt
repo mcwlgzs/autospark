@@ -1,56 +1,26 @@
-# 面板后端的运行时依赖（直接依赖，用 == 锁死）。
+# 抖音火花助手（单用户版）—— 面板后端依赖
 #
-# 为什么全部锁死而不是写 `fastapi` 这样的宽松约束：
-#   selenium 与浏览器版本是强耦合的 —— 新版本会在启动 Chrome 时因为
-#   driver / BiDi 协议协商不匹配而直接抛 SessionNotCreatedException。
-#   本机实测组合是 Chrome 152.0.7977.84 + selenium 4.49.0，
-#   所以这里把整个依赖树钉在「验证过能跑」的那一组版本上；
-#   升级 Chrome 时必须同步回归测试这几行，不要随手放开版本号。
+# 这份清单只列 backend.py 真正 import 到的东西（实测：import backend 后
+# 比对 sys.modules 的结果），加上跑测试要用的 pytest。其余历史模块
+# （models.py / dal.py / security.py / monitoring.py / browser_manager.py /
+# playwright_manager.py / protocol_sender.py 等）目前没有任何入口引用，
+# 属于实验遗留，不在这里装依赖；哪天要把它们接回面板，再按需补
+# sqlalchemy / psutil / structlog / cryptography / passlib / python-jose /
+# playwright 等。
 #
-# 注意：本项目已经用 spark_core 里的内置 ticker 取代了 schedule 库
-#   （schedule 不持久化、也没有异常隔离，一次异常就会把调度线程打死），
-#   所以这里不再有 schedule，请不要加回来。
+# 关于版本号：全部用 == 锁死，不留浮动空间。
+#   selenium 与浏览器是强耦合的，跨版本升级经常因为 driver 协商不匹配
+#   直接抛 SessionNotCreatedException。本机实测可跑的组合是
+#   Chrome 152.0.7977.84 + selenium 4.49.0 —— 升级 Chrome 时必须把这几行
+#   一起回归一遍，确认没问题再改版本号。
 
+# ---- 运行时（backend.py 的 import 闭包）----
 fastapi==0.141.1
 uvicorn==0.52.4
 selenium==4.49.0
 requests==2.34.2
+# FastAPI 只在解析表单 / 文件上传时才 import 它，光搜代码搜不到，别删。
 python-multipart==0.0.32
 
-# 数据库支持（异步）
-sqlalchemy==2.0.36
-alembic==1.14.0
-aiosqlite==0.20.0
-aiomysql==0.2.0
-
-# 密码和安全
-bcrypt==4.2.1
-python-jose[cryptography]==3.3.0
-passlib[bcrypt]==1.7.4
-cryptography==42.0.5
-
-# Selenium 反检测
-undetected-chromedriver==3.5.5
-selenium-stealth==1.0.6
-
-# 任务调度
-fastapi-scheduler==0.0.15
-APScheduler==3.10.4
-
-# 监控和日志
-structlog==24.1.0
-prometheus-fastapi-instrumentator==7.0.0
-
-# 性能优化
-redis==5.0.1
-celery==5.3.6
-
-# 数据处理
-pandas==2.2.1
-openpyxl==3.1.2
-
-# ---- 以下是上面这些包带来的间接依赖，仅供排查问题时对照，不要显式安装 ----
-# 之所以写在这里而不是钉进上面的列表：它们是 fastapi 的传递依赖，
-# 跟着 fastapi 的版本走即可；显式钉住反而会在升级 fastapi 时制造假冲突。
-#   pydantic==2.13.5
-#   starlette==1.6.0
+# ---- 测试 ----
+pytest==9.1.1

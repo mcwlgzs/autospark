@@ -50,6 +50,14 @@
             <span v-else class="not-sign">—</span>
           </template>
         </el-table-column>
+        <el-table-column label="来源" width="110">
+          <template #default="{ row }">
+            <!-- 同灵签列：老任务没有 source 字段（后端按 'text' 处理），只认严格的枚举值 -->
+            <el-tag v-if="row.source === 'hitokoto'" type="primary" effect="plain" size="small">一言</el-tag>
+            <el-tag v-else-if="row.source === 'girlfriend'" type="success" effect="plain" size="small">女朋友模式</el-tag>
+            <span v-else class="not-sign">自写</span>
+          </template>
+        </el-table-column>
         <el-table-column label="操作" width="280" fixed="right">
           <template #default="{ row }">
             <el-button type="warning" size="small" @click="openEditDialog(row)">
@@ -107,16 +115,54 @@
             机器重启错过当天时间点后会补跑。
           </div>
         </el-form-item>
+        <el-form-item label="内容来源">
+          <el-radio-group v-model="taskForm.source">
+            <el-radio value="text">我自己写</el-radio>
+            <el-radio value="hitokoto">一言接口（每次发送现取一句）</el-radio>
+            <el-radio value="girlfriend">女朋友模式（天气问候）</el-radio>
+          </el-radio-group>
+          <div v-if="taskForm.source === 'girlfriend'" class="field-hint">
+            发送时按当时时段自动写早安/午安/晚安，带当天真实天气、农历和相识天数；
+            天气取不到时用下面的消息内容兜底。
+          </div>
+          <!-- 接口靠不靠谱用户自己判断：让人当场取一条看看，比事后发现发出去的
+               是一句兜底文案要好。取不到只是提示，不影响保存这条任务。 -->
+          <el-button
+            v-if="taskForm.source === 'hitokoto' || taskForm.source === 'girlfriend'"
+            class="preview-btn"
+            size="small"
+            :loading="previewLoading"
+            @click="taskForm.source === 'girlfriend' ? handlePreviewGirlfriend() : handlePreviewHitokoto()"
+          >
+            取一条试试
+          </el-button>
+          <div class="field-hint">
+            选「一言接口」后，这条任务每次发送前都会现取一句（https://v1.hitokoto.cn/?c=k，哲学分类），
+            格式是『正文』—— 「来源 作者」；下面的消息内容变成可选，只当接口取不到时的兜底。
+          </div>
+        </el-form-item>
         <el-form-item label="消息内容">
           <el-input
             v-model="taskForm.text"
             type="textarea"
             :rows="3"
-            placeholder="留空 = 每天发送前现取一条名言"
+            :placeholder="taskForm.source === 'hitokoto'
+              ? '可留空；接口取不到时会退回这里的文案'
+              : (taskForm.source === 'girlfriend'
+                ? '可留空；天气取不到时会退回这里的文案'
+                : '留空 = 每天发送前现取一条名言')"
           />
           <div class="field-hint">
             一行一条即为文案池，发送时随机挑一条；支持 {date}、{weekday} 占位符。
-            编辑时留空会让它恢复成每日名言。
+            <template v-if="taskForm.source === 'hitokoto'">
+              选了「一言接口」时，这里填的内容只在接口取不到时才会发出去。
+            </template>
+            <template v-else-if="taskForm.source === 'girlfriend'">
+              选了「女朋友模式」时，这里填的内容只在天气/接口取不到时才会发出去。
+            </template>
+            <template v-else>
+              编辑时留空会让它恢复成每日名言。
+            </template>
           </div>
         </el-form-item>
         <el-form-item label="灵签">
@@ -134,6 +180,12 @@
         </el-button>
       </template>
     </el-dialog>
+
+    <!-- 女朋友模式预览：接口返回的 text 是多行文本（天气 + 农历 + 问候），
+         必须用 pre-wrap 保留换行；一言那条路径维持原来的 ElMessage 展示不变 -->
+    <el-dialog v-model="previewDialogVisible" :title="previewDialogTitle" width="560px" destroy-on-close>
+      <pre class="preview-text">{{ previewDialogText }}</pre>
+    </el-dialog>
   </div>
 </template>
 
@@ -141,7 +193,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Refresh, Delete, Close, Tickets } from '@element-plus/icons-vue'
-import { getTaskList, addTask, delTask, editTask, getFriendsList, testTask, fallbackError } from '../api/douyin'
+import { getTaskList, addTask, delTask, editTask, getFriendsList, testTask, previewHitokoto, previewGirlfriend, fallbackError } from '../api/douyin'
 import { friendsList as storeFriendsList, setFriendsList } from '../stores/browser'
 
 const loading = ref(false)
@@ -162,7 +214,9 @@ const taskForm = ref({
   time: '',
   text: '',
   // 灵签任务开关：对应后端 sign 布尔字段，新增任务默认关（普通文字任务）
-  sign: false
+  sign: false,
+  // 内容来源：'text' = 用下面自己写的文案（默认）；'hitokoto' = 每次发送前现取一句一言
+  source: 'text'
 })
 
 const dialogTitle = computed(() => dialogMode.value === 'add' ? '添加定时任务' : '修改任务')
@@ -239,7 +293,9 @@ const openAddDialog = () => {
     name: '',
     time: '',
     text: '',
-    sign: false
+    sign: false,
+    // 新增默认「我自己写」：一言是可选项，不该被静默打开
+    source: 'text'
   }
   dialogVisible.value = true
 }
@@ -254,7 +310,9 @@ const openEditDialog = (task) => {
     text: task.text || '',
     // 按任务当前状态回填灵签开关：老任务没有这个字段（undefined）要当成 false，
     // 提交时也只是显式写回 false，不会把老任务意外升级成灵签任务
-    sign: task.sign === true
+    sign: task.sign === true,
+    // 同理想法：老任务没有 source 字段（undefined）按「我自己写」回填
+    source: task.source === 'hitokoto' || task.source === 'girlfriend' ? task.source : 'text'
   }
   dialogVisible.value = true
 }
@@ -272,15 +330,18 @@ const handleSubmit = async () => {
   submitLoading.value = true
   try {
     if (dialogMode.value === 'add') {
+      // source 显式传：这条任务到底是「自己写」还是「每次现取一句一言」
       await addTask(taskForm.value.time, taskForm.value.name, taskForm.value.text || null, {
-        sign: taskForm.value.sign
+        sign: taskForm.value.sign,
+        source: taskForm.value.source
       })
       ElMessage.success('添加成功')
     } else {
       // 把文案一起提交：留空表示恢复「每日名言」
       // sign 显式传：编辑时必须能把灵签任务关回普通任务（省略字段后端会保持原值）
       await editTask(taskForm.value.name, taskForm.value.time, taskForm.value.text || '', {
-        sign: taskForm.value.sign
+        sign: taskForm.value.sign,
+        source: taskForm.value.source
       })
       ElMessage.success('修改成功')
     }
@@ -291,6 +352,60 @@ const handleSubmit = async () => {
     ElMessage.error(dialogMode.value === 'add' ? '添加失败' : '修改失败')
   } finally {
     submitLoading.value = false
+  }
+}
+
+// 「取一条试试」：只把一言取回来显示给用户看，不发送任何消息。
+// 用户点这个按钮就是为了确认接口现在到底能不能用，所以失败必须说出来，不能静默。
+const previewLoading = ref(false)
+
+const handlePreviewHitokoto = async () => {
+  previewLoading.value = true
+  try {
+    const res = await previewHitokoto()
+    if (res?.data?.text) {
+      ElMessage.success(res.data.text)
+    } else {
+      ElMessage.error('一言接口暂时取不到内容，请稍后再试')
+    }
+  } catch (error) {
+    // 取不到时后端返回 code 400，拦截器已经弹过那条真实原因；这里只兜住
+    // 「压根没连上」这类没有提示的情况，避免一次失败弹出两条消息
+    fallbackError(error, '一言接口暂时取不到内容，请稍后再试')
+  } finally {
+    previewLoading.value = false
+  }
+}
+
+// 「取一条试试」的女朋友模式分支：单独走 previewGirlfriend，不复用一言那条路径。
+// 返回的 text 是多行正文，用弹窗 + pre-wrap 展示；失败时后端 res.data 是中文原因字符串。
+const previewDialogVisible = ref(false)
+const previewDialogTitle = ref('女朋友模式预览')
+const previewDialogText = ref('')
+
+const handlePreviewGirlfriend = async () => {
+  previewLoading.value = true
+  try {
+    const res = await previewGirlfriend('auto')
+    // 成功时 data 是**对象**（{period, period_text, text}），失败时是字符串
+    const detail = res?.data
+    if (detail && typeof detail === 'object' && detail.text) {
+      previewDialogTitle.value = detail.period_text
+        ? `女朋友模式预览（${detail.period_text}）`
+        : '女朋友模式预览'
+      previewDialogText.value = detail.text
+      previewDialogVisible.value = true
+    } else {
+      ElMessage.error(typeof detail === 'string' && detail
+        ? detail
+        : '女朋友模式暂时取不到内容，请稍后再试')
+    }
+  } catch (error) {
+    // 取不到时后端返回 code 400，拦截器已经弹过那条真实原因；这里只兜住
+    // 「压根没连上」这类没有提示的情况，避免一次失败弹出两条消息
+    fallbackError(error, '女朋友模式暂时取不到内容，请稍后再试')
+  } finally {
+    previewLoading.value = false
   }
 }
 
@@ -411,6 +526,23 @@ const handleBatchDelete = async () => {
 /* 非灵签任务的占位符：用浅色破折号，突出真正的灵签标签 */
 .not-sign {
   color: #c0c4cc;
+}
+
+/* 「取一条试试」：跟在来源单选框后面，单独占一行，别把单选挤到一边 */
+.preview-btn {
+  display: block;
+  margin-top: 6px;
+}
+
+/* 女朋友模式预览正文：保留接口返回的多行换行（ElMessage 会把换行挤成一行） */
+.preview-text {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.8;
+  color: #303133;
 }
 
 /* 响应式适配 */

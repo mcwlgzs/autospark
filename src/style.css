@@ -93,3 +93,18 @@ html, body, #app {
     display: none !important;
   }
 }
+
+/* 表格里「内容太长，鼠标停一下看全」的提示框。
+   默认会跟着内容长短一路撑开 —— 一条女朋友问候能铺满半个屏幕（用户 2026-09-28 反馈
+   「消息内容鼠标停留怎么显示那么长」）。这里统一收成一个固定大小的小框，超出的在框内滚动。
+   用法：列上写 :show-overflow-tooltip="{ popperClass: 'spark-cell-tip', showArrow: false, enterable: true }"
+   —— enterable 是必须的，否则鼠标一挪进框里提示就消失，滚不动。
+   关掉小三角是因为 overflow 会把它裁掉。 */
+.el-popper.spark-cell-tip {
+  max-width: 420px;
+  max-height: 240px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  line-height: 1.6;
+}

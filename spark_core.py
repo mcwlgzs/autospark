@@ -196,8 +196,17 @@ def history_clean(history, today, keep_days=HISTORY_KEEP_DAYS) -> dict:
     return kept
 
 
-def make_history_record(status, at=None, text=None, detail=None) -> dict:
+def make_history_record(status, at=None, text=None, detail=None, kind=None) -> dict:
+    """一条发送记账。
+
+    kind 记录「这条是谁发出去的」：定时 / 补跑 / 当日补发 / 人工重发 / 手动发送 /
+    试发。以前不存这个字段，面板上就只剩时间和结果，看不出是定时发的还是自己手点
+    的那一下 —— 而这两件事在排查（尤其是「怎么又发了一条」）时差别很大。
+    旧记录没有 kind 是正常的，读取端按空值处理即可。
+    """
     record = {'status': status, 'at': at or datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+    if kind:
+        record['kind'] = str(kind)[:32]
     if text:
         record['text'] = str(text)[:200]
     if detail:

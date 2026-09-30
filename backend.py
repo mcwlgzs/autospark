@@ -118,6 +118,10 @@ REMOTE_QUOTE = _env_bool('SPARK_REMOTE_QUOTE', False)
 ALLOW_PRIVATE_PUSH = _env_bool('SPARK_ALLOW_PRIVATE_PUSH', False)
 # 只有显式设置时才覆盖 Chrome 自己的 UA。写死旧版本会和真实浏览器不一致。
 CHROME_USER_AGENT = os.getenv('SPARK_USER_AGENT', '').strip()
+# 后端监听地址。默认只绑 127.0.0.1：对外的访问一律交给 nginx 反代 + HTTPS，
+# 后端裸奔在 0.0.0.0 上意味着面板密码和 token 在内网里明文乱跑。
+# 安全中心会把这个值读出来如实展示，所以它必须是唯一的真源（不能再写死在 uvicorn.run 里）。
+BIND_HOST = os.getenv('SPARK_HOST', '127.0.0.1').strip() or '127.0.0.1'
 
 # ==================== 图片发送 / 文昌帝君灵签 ====================
 # 图片是从第三方接口给的直链下载下来的。下载目录放在 data/ 下而不是系统临时目录：
@@ -196,6 +200,62 @@ def build_chrome_options():
     options.add_argument('--start-maximized')
     options.add_argument("--force-device-scale-factor=0.25")
     return options
+
+
+# ---------------------------------------------------------------- 反检测
+# Selenium / WebDriver 会在浏览器里留下两处「不需要任何高级手段就能读到」的
+# 自动化痕迹：
+#   1. navigator.webdriver === true（真实浏览器里这个属性存在且是 false）；
+#   2. chromedriver 往 window 上挂的 cdc_ / $cdc_ 开头的变量。
+# 抖音的风控脚本第一件事就是读它。这里把这两处抹掉。
+#
+# 刻意「只抹痕、不伪造」：
+#   * 不改 User-Agent、不动 navigator.plugins / languages、不改分辨率。
+#     这个程序跑的是本机真实 Chrome + 持久化 profile，这些值本来就是真的；
+#     手工换成假的只会造出「UA 说 Windows、navigator.platform 说别的」这种
+#     更扎眼的自相矛盾 —— 业界的经验是「指纹一致」比「指纹伪造」重要得多。
+#   * selenium_stealth.py 里那份 _inject_stealth_js() 顺手还会随机 UA、
+#     把 navigator.plugins 换成一串假数字，所以没有直接复用它。
+STEALTH_JS = """
+(() => {
+  try {
+    Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true });
+  } catch (e) {}
+  try {
+    for (const key of Object.keys(window)) {
+      if (key.indexOf('cdc_') === 0 || key.indexOf('$cdc_') === 0) {
+        try { delete window[key]; } catch (e) {}
+      }
+    }
+  } catch (e) {}
+})();
+"""
+
+# 反检测脚本是否真的注入成功过。安全中心如实报告这一项：
+# 「以为开了反检测其实没开」比「明确知道没开」危险得多。
+_stealth_injected = False
+
+# 本轮最后一次成功启动的浏览器版本（由 driver.capabilities 读出）。
+# 单独记着是因为安全中心要显示「自动化引擎版本」，而浏览器没跑的时候
+# capabilities 是拿不到的 —— 那时显示「本轮还没启动过」比显示一个假版本强。
+_browser_version = ''
+
+
+def _inject_stealth_js(target):
+    """把反检测脚本挂到每一个新文档上，保证在页面自己的 JS 之前生效。"""
+    global _stealth_injected
+    try:
+        target.execute_cdp_cmd(
+            'Page.addScriptToEvaluateOnNewDocument', {'source': STEALTH_JS}
+        )
+        _stealth_injected = True
+        return True
+    except Exception as exc:
+        _stealth_injected = False
+        # 注入失败不影响登录和发送，所以不能因此中断初始化；
+        # 但自动化痕迹会暴露出去，必须留下记录（安全中心会据此报警）。
+        log_event('warn', '浏览器', '反检测脚本注入失败（登录和发送不受影响，但自动化痕迹会暴露）', exc)
+        return False
 
 
 def _body_text():
@@ -909,6 +969,812 @@ def AiqingGongyu_text():
     return random.choice(FALLBACK_MESSAGES)
 
 
+# ==================== 一言（hitokoto）：任务的正文可以「发送时现取一句」 ====================
+# 地址和超时都走环境变量：换镜像站不用改代码，测试也能把它指到本地桩上，不发真实请求。
+# ?c=k 是按用户要求限定「哲学」分类（hitokoto 的 c 参数：k=哲学）。不带分类会随机到
+# 动画 / 游戏 / 抖机灵那些不适合发给好友的内容；要换分类改这个环境变量即可。
+HITOKOTO_URL = os.getenv('SPARK_HITOKOTO_URL', 'https://v1.hitokoto.cn/?c=k')
+HITOKOTO_TIMEOUT = _env_int('SPARK_HITOKOTO_TIMEOUT', 8)
+
+
+def _format_hitokoto(text, payload):
+    """把一句一言拼成最终要发出去的那条消息：『正文』—— 「来源 作者」。
+
+    例：『我觉得世界无聊，是因为我的世界本身已经足够有趣了。』—— 「永远的七日之都 璐璐」
+    from / from_who 可能缺一个甚至两个都缺，缺谁就不写谁；两个都没有时只发正文，
+    不留半个空括号 —— 宁可少写，也不要发出「—— 「」」这种东西。
+    """
+    source = str(payload.get('from') or '').strip()
+    author = str(payload.get('from_who') or '').strip()
+    who = ' '.join(part for part in (source, author) if part)
+    if not who:
+        return text
+    return '『%s』—— 「%s」' % (text, who)
+
+
+def fetch_hitokoto():
+    """取一句一言，成功返回**要发出去的那整段文字**，取不到返回 None。
+
+    返回的是完整的一条消息：正文用 『』 包起来，后面接 —— 「来源 作者」（用户 m03008
+    指定的格式）。面板上「取一条试试」看到的就是真正发出去的那段文字。
+
+    失败一律返回 None 而不是抛出去：调用方（定时任务）的第一目标是「火花不能断」，
+    取不到就用任务自己的文案兜底，绝不能因为这个第三方接口挂了就整天不发。
+    """
+    try:
+        req = requests.get(HITOKOTO_URL, timeout=HITOKOTO_TIMEOUT)
+        if req.status_code != 200:
+            log_event('warn', '一言', '一言接口返回异常状态码 %s' % req.status_code)
+            return None
+        payload = req.json() or {}
+        if not isinstance(payload, dict):
+            log_event('warn', '一言', '一言接口返回的不是一个 JSON 对象')
+            return None
+        value = payload.get('hitokoto')
+        text = str(value).strip() if value else ''
+        if not text:
+            log_event('warn', '一言', '一言接口没有返回可用内容')
+            return None
+        return _format_hitokoto(text, payload)
+    except Exception as exc:
+        log_event('warn', '一言', '获取一言失败', exc)
+        return None
+
+
+# 定时任务的内容来源：'text' = 用任务自己存的文案池；'hitokoto' = 每次发送前现取一句；
+# 'girlfriend' = 按发送时刻的时段现渲染一条天气问候（见下面的「女朋友模式」）
+TASK_SOURCES = ('text', 'hitokoto', 'girlfriend')
+
+
+def _normalise_task_source(value):
+    """归一化任务的内容来源：None / 空 / 非法值一律回落到 'text'。"""
+    source = str(value or '').strip().lower()
+    return source if source in TASK_SOURCES else 'text'
+
+
+def _task_source_error(value):
+    """校验请求体里的 source：没传（None / 空）合法，除此之外只认 TASK_SOURCES。"""
+    if value is None or not str(value).strip():
+        return None
+    if str(value).strip().lower() not in TASK_SOURCES:
+        return '内容来源不支持，只支持 text、hitokoto 或 girlfriend'
+    return None
+
+
+def _task_source_note(source):
+    """任务日志里那句「正文从哪来」的说明；'text' 是默认口径，不加尾巴。"""
+    if source == 'hitokoto':
+        return '（正文取一言接口，写下的文案只当兜底）'
+    if source == 'girlfriend':
+        return '（正文按发送时刻现渲染天气问候，写下的文案只当兜底）'
+    return ''
+
+
+# ==================== 女朋友模式（和风天气 + 农历 + 问候语） ====================
+# 给「早安 / 午安 / 晚安」加一个内容来源：按发送时刻的时段，用和风天气的真实天气
+# 渲染一条情侣贺卡式的问候语。Host 与 Key 都由用户在设置面板里填 —— 和风天气给每个
+# 项目分配的专属域名都不一样，代码里不硬编码任何密钥。
+#
+# 冻死的接口（前端 src/api/douyin.js 与 src/views/Settings.vue 已按这套字段写好）：
+#   GET  /Api/Girlfriend/Config  -> {'code':200,'data':{...配置字段...,'city_resolved':bool,
+#                                    'city_resolved_text':str,'meet_days':int|None}}
+#     city_resolved 只说明「坐标有了」，面板上要显示的城市名是 city_resolved_text
+#     （解析出来的正式名 + 省市，没解析过就是用户填的原文）—— 只回布尔会让界面显示成 'true'。
+#   POST /Api/Girlfriend/Config  -> 同上（body 是部分字段，未知字段忽略）
+#   GET  /Api/Girlfriend/Weather?refresh=0 -> {'code':200,'data':{'city','lat','lon','tz','current','daily','text'}}
+#   GET  /Api/Girlfriend/Preview?period=auto|morning|noon|night -> {'code':200,'data':{'period','period_text','text'}}
+# 失败一律是 {'code':400,'data':'<中文原因>'}，绝不把异常抛给调用方。
+GF_CONFIG_FIELDS = ('enabled', 'host', 'key', 'city', 'lat', 'lon', 'tz',
+                    'meet_date', 'her_name', 'my_name', 'city_name', 'city_adm')
+# 落盘结构：除 enabled 是布尔，其余都是字符串。缺字段一律按默认值补齐，
+# 于是老 state.json 里没有 girlfriend 键、或者以后加了新字段，都能读。
+GF_DEFAULT_CONFIG = {
+    'enabled': False,
+    'host': '',
+    'key': '',
+    'city': '',
+    'lat': '',
+    'lon': '',
+    'tz': '',
+    'meet_date': '',
+    'her_name': '',
+    'my_name': '',
+    # city_name / city_adm 不是用户填的，是 GeoAPI 解析出来的城市正式名与省市
+    # （'义乌' + '浙江省 金华'）。面板上「已解析城市」显示的就是它们 —— 只回一个
+    # 布尔的话，界面会直接显示成 'true'（我自己踩过这个坑）。城市一改就一起作废。
+    'city_name': '',
+    'city_adm': '',
+}
+# 和风天气每个项目的 Host 形如 https://xxxxx.qweatherapi.com（每项目一个专属域名）。
+# 超时走环境变量，测试里可以调小，免得 stub 出问题时把测试挂死。
+QWEATHER_TIMEOUT = _env_int('SPARK_QWEATHER_TIMEOUT', 10)
+GF_PERIOD_TEXT = {'morning': '早安', 'noon': '午安', 'night': '晚安'}
+# 问候语首行（用户卡片口气）：时段词并进「哈喽哈喽」那一句，不再单独占一行。
+# my_name 有值时才在「这里是」后面插「来自{称呼}的」，所以绝不会出现空的「来自」。
+GF_GREETING = {
+    'morning': '哈喽哈喽~早安呀，这里是爱心提醒哦：',
+    'noon': '哈喽哈喽~午安呀，这里是爱心提醒哦：',
+    'night': '哈喽哈喽~晚安呀，这里是爱心提醒哦：',
+}
+GF_WEEKDAYS = ('一', '二', '三', '四', '五', '六', '日')
+# 八个方位。和风天气给的是 16 方位码（n / nne / ne / ene …），中途方位就近归并。
+GF_WIND_DIRECTIONS = (
+    ('n', '北'), ('ne', '东北'), ('e', '东'), ('se', '东南'),
+    ('s', '南'), ('sw', '西南'), ('w', '西'), ('nw', '西北'),
+)
+GF_COMPASS_16 = ('n', 'nne', 'ne', 'ene', 'e', 'ese', 'se', 'sse',
+                 's', 'ssw', 'sw', 'wsw', 'w', 'wnw', 'nw', 'nnw')
+
+
+def _girlfriend_config():
+    """读女朋友模式配置：缺的字段一律补默认值，返回的永远是一份可直接用的 dict。"""
+    stored = STATE.get('girlfriend')
+    config = dict(GF_DEFAULT_CONFIG)
+    if isinstance(stored, dict):
+        for field in GF_CONFIG_FIELDS:
+            if field in stored:
+                config[field] = stored[field]
+    config['enabled'] = _bool_flag(config.get('enabled'))
+    for field in GF_CONFIG_FIELDS:
+        if field == 'enabled':
+            continue
+        value = config.get(field)
+        config[field] = '' if value is None else str(value).strip()
+    return config
+
+
+def _girlfriend_view(config=None):
+    """接口回显用的视图：配置字段 + 派生字段。
+
+    Key 是凭据，照「消息通知」的口径不回明文：前端拿 key_set 显示「已配置」，
+    保存时留空即表示「不修改已保存的那一份」。
+    """
+    config = _girlfriend_config() if config is None else config
+    view = dict(config)
+    view['key'] = ''
+    view['key_set'] = bool(config.get('key'))
+    view['city_resolved'] = bool(str(config.get('lat') or '').strip()
+                                 and str(config.get('lon') or '').strip())
+    # 面板上「已解析城市：」后面要显示的是城市名，不是 true/false。
+    # 优先用 GeoAPI 解析出来的正式名（义乌 + 浙江省 金华），没解析过就退回用户填的原文。
+    resolved_name = str(config.get('city_name') or '').strip() or config['city']
+    resolved_adm = str(config.get('city_adm') or '').strip()
+    if resolved_name and resolved_adm:
+        view['city_resolved_text'] = '%s（%s）' % (resolved_name, resolved_adm)
+    else:
+        view['city_resolved_text'] = resolved_name
+    view['meet_days'] = girlfriend_meet_days(config)
+    return view
+
+
+def _parse_meet_date(value):
+    """把 'YYYY-MM-DD' 解析成 datetime：空 / 格式不对 / 日期不存在都返回 None。"""
+    text = str(value or '').strip()
+    if not text or not re.match(r'^\d{4}-\d{2}-\d{2}$', text):
+        return None
+    try:
+        return datetime.strptime(text, '%Y-%m-%d')
+    except ValueError:
+        return None
+
+
+def _valid_meet_date(value):
+    """相识日期是否是一个合法的 YYYY-MM-DD（供保存接口做 400 校验）。"""
+    return _parse_meet_date(value) is not None
+
+
+def girlfriend_meet_days(config=None, moment=None):
+    """相识天数：(今天 - 相识日期).days + 1；没填或格式不对返回 None。
+
+    第 1 天就是相识当天（不填日期这一行整行不出现）。
+    """
+    config = _girlfriend_config() if config is None else config
+    meet = _parse_meet_date(config.get('meet_date'))
+    if meet is None:
+        return None
+    today = (moment or datetime.now()).date()
+    return (today - meet.date()).days + 1
+
+
+def girlfriend_period(moment=None):
+    """发送时刻的小时决定时段：< 11 早安、11–16 午安、≥ 17 晚安。"""
+    hour = (moment or datetime.now()).hour
+    if hour < 11:
+        return 'morning'
+    if hour < 17:
+        return 'noon'
+    return 'night'
+
+
+def _gf_nested(node, *path):
+    """按路径取嵌套字段：中途不是 dict 就返回 None（和风天气的字段层级不固定）。"""
+    current = node
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _gf_first(*values):
+    """取第一个「有值」的候选：None / 空串 / 空白串都跳过。"""
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if value.strip():
+                return value.strip()
+            continue
+        return value
+    return None
+
+
+def _gf_number(value):
+    """转成 float；转不动就返回 None（缺字段的整行不出现，不要写 0）。"""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _gf_round(value):
+    """四舍五入取整。
+
+    不能直接用 round()：它是「银行家舍入」，round(2.5) == 2 —— 天气里的 2.5℃
+    被舍成 2℃ 属于肉眼可见的错。
+    """
+    number = float(value)
+    return int(number + 0.5) if number >= 0 else -int(-number + 0.5)
+
+
+def _gf_display_number(value):
+    """整数就按整数显示（aqi 123.0 → '123'），否则原样。"""
+    number = _gf_number(value)
+    if number is None:
+        return str(value)
+    return str(int(number)) if float(number).is_integer() else str(number)
+
+
+def _gf_wind_direction(compass):
+    """把 compass 归并成 8 个中文方位；none / vrb / 未知取值返回 None（整行省略）。"""
+    text = str(compass or '').strip().lower()
+    if not text or text in ('none', 'vrb') or text not in GF_COMPASS_16:
+        return None
+    index = GF_COMPASS_16.index(text)
+    return GF_WIND_DIRECTIONS[(index + 1) // 2 % 8][1]
+
+
+def _gf_humidity_percent(value):
+    """湿度按小数制（0.95 → 95%）；万一是百分制（>1.5）就原样用，别渲染成 5500%。"""
+    number = _gf_number(value)
+    if number is None:
+        return None
+    if number <= 1.5:
+        number *= 100
+    return _gf_round(number)
+
+
+def _gf_temp_band(tmax):
+    """把最高温归到一个档位：None / 'freezing' / 'cold' / 'cool' / 'mild' / 'hot'。
+
+    阈值**只有这一份**：`_gf_advice` 的建议正文和「{她}…」那行都从它派生，
+    别在两处各写一套（改档位只需要改这里）。
+    """
+    high = _gf_number(tmax)
+    if high is None:
+        return None
+    high = _gf_round(high)
+    if high <= 0:
+        return 'freezing'
+    if high < 10:
+        return 'cold'
+    if high < 18:
+        return 'cool'
+    if high < 26:
+        return 'mild'
+    return 'hot'
+
+
+def _gf_advice(tmax, precipitation):
+    """按最高温给建议，降水为雨/雪再补一句；取不到就返回空列表（整段不出现）。"""
+    lines = []
+    high = _gf_number(tmax)
+    band = _gf_temp_band(high)
+    if band is not None:
+        high = _gf_round(high)
+        lines.append({
+            # 「仅为」只在真的冷的时候用：34℃ 说「最高温度仅为 34℃」是反话。
+            'freezing': '今日最高温度仅为 %d℃，冷得很~',
+            'cold': '今日最高温度仅为 %d℃，可冷了~',
+            'cool': '今日最高温度 %d℃，有点凉，记得加件外套',
+            'mild': '今日最高温度 %d℃，温度刚好，出去走走吧',
+            'hot': '今日最高温度 %d℃，有点热，记得多喝水',
+        }[band] % high)
+    kind = str(precipitation or '').strip().lower()
+    if kind == 'rain':
+        lines.append('今天有雨，记得带伞哦~')
+    elif kind == 'snow':
+        lines.append('今天有雪，出门当心路滑~')
+    return lines
+
+
+def _gf_her_line(her_name, tmax):
+    """「{她}…」那行：也按最高温分档（34℃ 不该让人「注意保暖」）。
+
+    没填昵称就整行不出现；拿不到温度时用不预设冷热的中性说法。
+    """
+    name = str(her_name or '').strip()
+    if not name:
+        return None
+    tail = {
+        'freezing': '可要注意保暖哦~',
+        'cold': '可要注意保暖哦~',
+        'cool': '记得添件衣服哦~',
+        'mild': '今天天气不错，出去走走吧~',
+        'hot': '记得多喝水哦~',
+    }.get(_gf_temp_band(tmax), '记得照顾好自己哦~')
+    return name + tail
+
+
+def _gf_greeting_line(period, my_name=None):
+    """问候语首行：把时段词并进「哈喽哈喽」那句；没填称呼就绝不出现空的「来自」。"""
+    line = GF_GREETING.get(period) or GF_GREETING[girlfriend_period()]
+    name = str(my_name or '').strip()
+    if name:
+        line = line.replace('这里是', '这里是来自%s的' % name, 1)
+    return line
+
+
+# ---- 农历：内置一张 1900–2100 的压缩表（每年一个整数），不引入任何新依赖 ----
+# 已用 1900–2100 全部 201 个春节（正月初一的阳历日期）逐条校验，全部命中；
+# 用户截图里的 2022-01-24 = 腊月廿二、2024-02-10 = 正月初一 也对得上。
+LUNAR_INFO = [
+    0x04bd8, 0x04ae0, 0x0a570, 0x054d5, 0x0d260, 0x0d950, 0x16554, 0x056a0, 0x09ad0, 0x055d2,
+    0x04ae0, 0x0a5b6, 0x0a4d0, 0x0d250, 0x1d255, 0x0b540, 0x0d6a0, 0x0ada2, 0x095b0, 0x14977,
+    0x04970, 0x0a4b0, 0x0b4b5, 0x06a50, 0x06d40, 0x1ab54, 0x02b60, 0x09570, 0x052f2, 0x04970,
+    0x06566, 0x0d4a0, 0x0ea50, 0x06e95, 0x05ad0, 0x02b60, 0x186e3, 0x092e0, 0x1c8d7, 0x0c950,
+    0x0d4a0, 0x1d8a6, 0x0b550, 0x056a0, 0x1a5b4, 0x025d0, 0x092d0, 0x0d2b2, 0x0a950, 0x0b557,
+    0x06ca0, 0x0b550, 0x15355, 0x04da0, 0x0a5b0, 0x14573, 0x052b0, 0x0a9a8, 0x0e950, 0x06aa0,
+    0x0aea6, 0x0ab50, 0x04b60, 0x0aae4, 0x0a570, 0x05260, 0x0f263, 0x0d950, 0x05b57, 0x056a0,
+    0x096d0, 0x04dd5, 0x04ad0, 0x0a4d0, 0x0d4d4, 0x0d250, 0x0d558, 0x0b540, 0x0b6a0, 0x195a6,
+    0x095b0, 0x049b0, 0x0a974, 0x0a4b0, 0x0b27a, 0x06a50, 0x06d40, 0x0af46, 0x0ab60, 0x09570,
+    0x04af5, 0x04970, 0x064b0, 0x074a3, 0x0ea50, 0x06b58, 0x055c0, 0x0ab60, 0x096d5, 0x092e0,
+    0x0c960, 0x0d954, 0x0d4a0, 0x0da50, 0x07552, 0x056a0, 0x0abb7, 0x025d0, 0x092d0, 0x0cab5,
+    0x0a950, 0x0b4a0, 0x0baa4, 0x0ad50, 0x055d9, 0x04ba0, 0x0a5b0, 0x15176, 0x052b0, 0x0a930,
+    0x07954, 0x06aa0, 0x0ad50, 0x05b52, 0x04b60, 0x0a6e6, 0x0a4e0, 0x0d260, 0x0ea65, 0x0d530,
+    0x05aa0, 0x076a3, 0x096d0, 0x04afb, 0x04ad0, 0x0a4d0, 0x1d0b6, 0x0d250, 0x0d520, 0x0dd45,
+    0x0b5a0, 0x056d0, 0x055b2, 0x049b0, 0x0a577, 0x0a4b0, 0x0aa50, 0x1b255, 0x06d20, 0x0ada0,
+    0x14b63, 0x09370, 0x049f8, 0x04970, 0x064b0, 0x168a6, 0x0ea50, 0x06b20, 0x1a6c4, 0x0aae0,
+    0x0a2e0, 0x0d2e3, 0x0c960, 0x0d557, 0x0d4a0, 0x0da50, 0x05d55, 0x056a0, 0x0a6d0, 0x055d4,
+    0x052d0, 0x0a9b8, 0x0a950, 0x0b4a0, 0x0b6a6, 0x0ad50, 0x055a0, 0x0aba4, 0x0a5b0, 0x052b0,
+    0x0b273, 0x06930, 0x07337, 0x06aa0, 0x0ad50, 0x14b55, 0x04b60, 0x0a570, 0x054e4, 0x0d160,
+    0x0e968, 0x0d520, 0x0daa0, 0x16aa6, 0x056d0, 0x04ae0, 0x0a9d4, 0x0a2d0, 0x0d150, 0x0f252,
+    0x0d520,
+]
+LUNAR_BASE = datetime(1900, 1, 31)
+LUNAR_MONTHS = ('正月', '二月', '三月', '四月', '五月', '六月',
+                '七月', '八月', '九月', '十月', '冬月', '腊月')
+LUNAR_DAYS = ('初一', '初二', '初三', '初四', '初五', '初六', '初七', '初八', '初九', '初十',
+              '十一', '十二', '十三', '十四', '十五', '十六', '十七', '十八', '十九', '二十',
+              '廿一', '廿二', '廿三', '廿四', '廿五', '廿六', '廿七', '廿八', '廿九', '三十')
+
+
+def _lunar_month_days(year, month):
+    """农历某年某月是小月（29 天）还是大月（30 天）：第 month 位是 1 就是大月。"""
+    return 30 if (LUNAR_INFO[year - 1900] & (0x10000 >> month)) else 29
+
+
+def _lunar_leap_month(year):
+    """农历某年的闰月（1–12），0 表示不闰。"""
+    return LUNAR_INFO[year - 1900] & 0xf
+
+
+def _lunar_leap_days(year):
+    """农历某年闰月的天数：0 表示不闰，否则 29 / 30（看第 16 位）。"""
+    if not _lunar_leap_month(year):
+        return 0
+    return 30 if (LUNAR_INFO[year - 1900] & 0x10000) else 29
+
+
+def _lunar_year_days(year):
+    """农历某年的总天数（12 个农历月 + 可能的闰月）。"""
+    days = 348
+    for month in range(12):
+        if LUNAR_INFO[year - 1900] & (0x8000 >> month):
+            days += 1
+    return days + _lunar_leap_days(year)
+
+
+def _lunar(year, month, day):
+    """阳历 → 农历中文（'腊月廿二' / '正月初一' / '闰三月初一'）。
+
+    只覆盖 1900-01-31 ~ 2100 年（表能算准的范围），超出返回 None ——
+    「宁缺勿错」：算不准就不写农历这一行，也不瞎猜。
+    """
+    try:
+        offset = (datetime(year, month, day) - LUNAR_BASE).days
+    except ValueError:
+        return None
+    if offset < 0:
+        return None
+    lunar_year = 1900
+    while lunar_year <= 2100:
+        days = _lunar_year_days(lunar_year)
+        if offset < days:
+            break
+        offset -= days
+        lunar_year += 1
+    else:
+        return None
+    leap = _lunar_leap_month(lunar_year)
+    lunar_month, is_leap = 1, False
+    while lunar_month <= 12:
+        if leap and lunar_month == leap + 1 and not is_leap:
+            span, is_leap = _lunar_leap_days(lunar_year), True
+        else:
+            span = _lunar_month_days(lunar_year, lunar_month)
+        if offset < span:
+            break
+        offset -= span
+        if is_leap:
+            is_leap = False
+        lunar_month += 1
+    if lunar_month > 12 or offset > 29:
+        return None
+    prefix = '闰' if is_leap else ''
+    return prefix + LUNAR_MONTHS[lunar_month - 1] + LUNAR_DAYS[offset]
+
+
+# ---- 和风天气请求 ----
+def _gf_api_get(host, key, path, params=None):
+    """统一的 QWeather GET：(payload, None) 或 (None, 中文原因)。
+
+    认证用 X-QW-Api-Key 请求头（新控制台的用法），不再用老的 ?key=。
+    网络异常 / 非 200 / 不是 JSON / 错误码全部在这里收成一句中文原因，
+    绝不抛给调用方 —— 天气接口挂了不该让整个发送任务炸掉。
+
+    实测结论（用只读探针打真实 Host，各端点返回的顶层 key）：
+        /geo/v2/city/lookup               -> ['code', 'location', 'refer']            code == '200'
+        /weather/v1/current/{lat}/{lon}    -> ['metadata', 'condition', ...]            **没有 code**
+        /weather/v1/daily/{lat}/{lon}      -> ['metadata', 'days']                      **没有 code**
+        /airquality/v1/current/{lat}/{lon} -> ['metadata', 'indexes', ...]              **没有 code**
+    也就是：老式 GeoAPI 靠顶层 `code` 报状态，新版 v1 天气 / 空气质量接口**根本不返回 code**，
+    新接口的错误走 HTTP 4xx/5xx + {'error': {'status':…, 'type':…, 'title':…}}。
+    所以这里 **字段不存在 ≠ 出错**：`code` 只在存在且非空时才校验。
+    （这里一度写成「无条件要求 code == '200'」，真实环境 /weather/v1/* 全被误判成
+    「错误码 未知」，取不到天气 —— 别改回去。）
+    """
+    base = str(host or '').strip().rstrip('/')
+    if not base:
+        return None, '请先在设置里填写和风天气 Host（形如 https://xxxxx.qweatherapi.com）'
+    if not base.startswith(('http://', 'https://')):
+        base = 'https://' + base
+    try:
+        response = requests.get(base + path, params=params or {},
+                                headers={'X-QW-Api-Key': str(key or '').strip()},
+                                timeout=QWEATHER_TIMEOUT)
+    except Exception as exc:
+        return None, '连接和风天气失败：%s' % exc
+    status = getattr(response, 'status_code', None)
+    if status in (401, 403):
+        return None, '和风天气拒绝了这次请求（HTTP %s）：请检查 Host 与 Key 是否配套' % status
+    if status != 200:
+        return None, '和风天气返回 HTTP %s' % status
+    try:
+        payload = response.json()
+    except Exception:
+        return None, '和风天气返回的内容不是合法 JSON'
+    if not isinstance(payload, dict):
+        return None, '和风天气返回的数据结构不是预期的对象'
+    # 1) 新 v1 接口的错误对象优先（正常 200 也可能带 error，把能拿到的都写进原因里）
+    error = payload.get('error')
+    if isinstance(error, dict) and error:
+        title = str(error.get('title') or '').strip()
+        kind = str(error.get('type') or '').strip()
+        status_value = error.get('status')
+        detail = title or kind or ('HTTP %s' % status_value if status_value is not None else '未知')
+        if status_value is not None and (title or kind):
+            detail = '%s（HTTP %s）' % (detail, status_value)
+        return None, '和风天气返回错误：%s' % detail
+    # 2) 老式接口的 code：只有存在且非空才校验。新 v1 天气 / 空气接口没有这个字段，
+    #    此时直接当成功放行（字段不存在 ≠ 出错），否则真实环境永远取不到天气。
+    code = str(payload.get('code') or '').strip()
+    if code and code != '200':
+        return None, '和风天气返回错误码 %s（请检查 Host、Key、城市名或坐标）' % code
+    return payload, None
+
+
+def _gf_resolve_location(config, refresh=False):
+    """定位：优先用配置里缓存的坐标，没有（或 refresh）才查 GeoAPI。
+
+    返回 ({'lat','lon','tz','name'}, None) 或 (None, 中文原因)。查到就写回配置，
+    下一次不用再打 GeoAPI —— 免费额度是有限的。
+    """
+    lat = str(config.get('lat') or '').strip()
+    lon = str(config.get('lon') or '').strip()
+    tz = str(config.get('tz') or '').strip()
+    city = str(config.get('city') or '').strip()
+    # 正式城市名与省市：命中缓存时沿用上次解析的结果，别把「义乌」退回成用户填的「义乌市」。
+    # resolved 标记「这次真的打了 GeoAPI」，调用方据此决定要不要把解析结果写回配置
+    # （缓存命中时 name/adm 只是回显，写回去等于用用户原文覆盖掉正式名）。
+    name = str(config.get('city_name') or '').strip() or city
+    adm = str(config.get('city_adm') or '').strip()
+    resolved = False
+    if refresh or not (lat and lon):
+        if city:
+            payload, error = _gf_api_get(config.get('host'), config.get('key'),
+                                         '/geo/v2/city/lookup',
+                                         {'location': city, 'range': 'cn',
+                                          'number': 1, 'lang': 'zh'})
+            if error:
+                return None, error
+            # GeoAPI 是老式接口，一定返回顶层 code；这里显式再确认一次，
+            # 别把上面 v1 接口「没有 code 也算成功」的规则放松到 GeoAPI 上。
+            geo_code = str(payload.get('code') or '').strip()
+            if geo_code != '200':
+                return None, '和风天气返回错误码 %s（请检查 Host、Key、城市名或坐标）' % (
+                    geo_code or '未知')
+            locations = payload.get('location')
+            found = None
+            if isinstance(locations, list):
+                for item in locations:
+                    if isinstance(item, dict) and _gf_first(item.get('lat'), item.get('lon')):
+                        found = item
+                        break
+            if found is None:
+                return None, '和风天气没有查到城市「%s」，请换一个写法试试' % city
+            lat = str(_gf_first(found.get('lat')) or '').strip()
+            lon = str(_gf_first(found.get('lon')) or '').strip()
+            tz = str(_gf_first(found.get('tz')) or tz).strip()
+            name = str(_gf_first(found.get('name')) or city).strip()
+            adm = ' '.join(part for part in (
+                str(_gf_first(found.get('adm1')) or '').strip(),
+                str(_gf_first(found.get('adm2')) or '').strip()) if part)
+            resolved = True
+    if not (lat and lon):
+        return None, '请先在设置里填写城市，或直接填好经纬度'
+    return {'lat': lat, 'lon': lon, 'tz': tz, 'name': name, 'adm': adm,
+            'resolved': resolved}, None
+
+
+def _gf_air_index(payload):
+    """从 airquality 的 indexes[] 里挑一项 AQI：返回 (aqi, 类别) 或 None。
+
+    注意这里的 `code` 是空气质量**指标**的代码，跟接口返回码同名不同义：
+    真实 v1 接口给的是 `cn-mee`（中国生态环境部标准 AQI，中国大陆用户看的就是这个），
+    老式/其它套餐才用笼统的 `aqi`。所以按 `cn-mee` → `aqi` → 第一个带数值 aqi 的项
+    依次挑（任务描述里的编号清单写的是 `aqi` 在前，但测试要求「同时存在时优先 cn-mee」，
+    这里按中国大陆口径实现）。取不到就返回 None —— 「尽力而为，少一行」的既有行为不变。
+    """
+    indexes = (payload or {}).get('indexes')
+    if not isinstance(indexes, list):
+        return None
+    items = [item for item in indexes if isinstance(item, dict)]
+
+    def pick(code):
+        for item in items:
+            if str(item.get('code') or '').strip().lower() == code:
+                return item
+        return None
+
+    def as_pair(item):
+        if not item:
+            return None
+        aqi = _gf_number(_gf_first(item.get('aqi')))
+        category = str(_gf_first(item.get('category')) or '')
+        if aqi is None and not category:
+            return None
+        return (aqi, category)
+
+    for code in ('cn-mee', 'aqi'):
+        pair = as_pair(pick(code))
+        if pair is not None:
+            return pair
+    for item in items:
+        aqi = _gf_number(_gf_first(item.get('aqi')))
+        if aqi is None:
+            continue
+        category = str(_gf_first(item.get('category')) or '')
+        return (aqi, category)
+    return None
+
+
+def collect_girlfriend_weather(config, location):
+    """取实时 / 每日 / 空气质量。
+
+    实时或每日任一失败就整条失败（没有温度和天气的问候语没有意义）；
+    空气质量是「尽力而为」：和风天气的空气质量是另一个接口、也可能不在套餐里，
+    取不到就悄悄少写「空气」这一行，不影响整条问候语。
+    """
+    host = str(config.get('host') or '').strip()
+    key = str(config.get('key') or '').strip()
+    lat = str(location.get('lat') or '').strip()
+    lon = str(location.get('lon') or '').strip()
+    current, error = _gf_api_get(host, key, '/weather/v1/current/%s/%s' % (lat, lon),
+                                 {'lang': 'zh'})
+    if error:
+        return None, error
+    daily, error = _gf_api_get(host, key, '/weather/v1/daily/%s/%s' % (lat, lon),
+                               {'days': 1, 'lang': 'zh'})
+    if error:
+        return None, error
+    days = daily.get('days')
+    day = days[0] if isinstance(days, list) and days and isinstance(days[0], dict) else {}
+    air = None
+    air_payload, air_error = _gf_api_get(host, key,
+                                         '/airquality/v1/current/%s/%s' % (lat, lon),
+                                         {'lang': 'zh'})
+    if not air_error:
+        air = _gf_air_index(air_payload)
+    return {'current': current, 'daily': day, 'air': air}, None
+
+
+def build_girlfriend_message(config, moment, period, data, quote=None):
+    """把配置 + 天气数据 + 时段渲染成一条短信（纯函数：不发任何网络请求）。
+
+    形状（缺数据的整行不出现）：
+        这是我们相识的第 N 天        ← 只有 meet_date 能解析时才出现
+        蚌埠 | 2026年09月28日 | 星期一   ← 城市为空就只剩「日期 | 星期X」
+        农历 | 八月十八              ← 农历算不出来就整行不出现
+        <空行>
+        今日天气状况：
+        天气： 小雪
+        东南风： 3级
+        温度： -1℃ ~ 3℃
+        湿度： 95%
+        空气： 轻度污染 | 123
+        <空行>
+        哈喽哈喽~早安呀，这里是来自小明的爱心提醒哦：
+        今日最高温度仅为 3℃，可冷了~
+        今天有雪，出门当心路滑~
+        小明可要注意保暖哦~
+        <空行>
+        『正文』—— 「来源 作者」
+    """
+    config = config or {}
+    moment = moment or datetime.now()
+    if period not in GF_GREETING:
+        period = girlfriend_period(moment)
+    data = data or {}
+    my_name = str(config.get('my_name') or '').strip()
+    her_name = str(config.get('her_name') or '').strip()
+
+    # 城市要出现在日期行里（用户卡片的排版），所以先算出来。
+    # 优先用配置里用户自己填的原文：天气接口那侧是 GeoAPI 的解析名（义乌市），
+    # 预览接口走缓存坐标时拿不到解析名（义乌）—— 同一份配置不该因为走哪条路而变脸。
+    city = str(_gf_first(config.get('city'), data.get('city')) or '').strip()
+
+    # 1) 日期块
+    date_lines = []
+    meet_days = girlfriend_meet_days(config, moment)
+    if meet_days is not None:
+        date_lines.append('这是我们相识的第 %d 天' % meet_days)
+    date_line = '%s | 星期%s' % (moment.strftime('%Y年%m月%d日'),
+                                 GF_WEEKDAYS[moment.weekday()])
+    if city:
+        # 城市为空时不要留下多余的「 | 」前缀
+        date_line = '%s | %s' % (city, date_line)
+    date_lines.append(date_line)
+    lunar = _lunar(moment.year, moment.month, moment.day)
+    if lunar:
+        date_lines.append('农历 | %s' % lunar)
+
+    # 2) 天气块（每日预报优先，实时数据兜底）
+    current = data.get('current') or {}
+    day = data.get('daily') or {}
+    daytime = _gf_nested(day, 'daytime') or {}
+    condition = _gf_first(_gf_nested(daytime, 'condition', 'text'),
+                          _gf_nested(current, 'condition', 'text'))
+    compass = _gf_first(_gf_nested(daytime, 'wind', 'direction', 'compass'),
+                        _gf_nested(current, 'wind', 'direction', 'compass'))
+    scale = _gf_first(_gf_nested(daytime, 'wind', 'scale'),
+                      _gf_nested(current, 'wind', 'scale'))
+    direction = _gf_wind_direction(compass)
+    tmax = _gf_first(_gf_nested(day, 'temperatureMax', 'value'))
+    tmin = _gf_first(_gf_nested(day, 'temperatureMin', 'value'))
+    humidity = _gf_humidity_percent(_gf_first(_gf_nested(current, 'humidity'),
+                                              _gf_nested(daytime, 'humidity')))
+    weather_lines = ['今日天气状况：']
+    if condition:
+        weather_lines.append('天气： %s' % condition)
+    if direction and scale:
+        weather_lines.append('%s风： %s级' % (direction, scale))
+    elif direction:
+        weather_lines.append('%s风' % direction)
+    elif scale:
+        weather_lines.append('风力： %s级' % scale)
+    if tmax is not None and tmin is not None:
+        weather_lines.append('温度： %d℃ ~ %d℃' % (_gf_round(tmin), _gf_round(tmax)))
+    elif tmax is not None:
+        weather_lines.append('温度： 最高 %d℃' % _gf_round(tmax))
+    elif tmin is not None:
+        weather_lines.append('温度： 最低 %d℃' % _gf_round(tmin))
+    if humidity is not None:
+        weather_lines.append('湿度： %d%%' % humidity)
+    air = data.get('air')
+    if air:
+        aqi_value, air_category = air
+        if air_category and aqi_value is not None:
+            weather_lines.append('空气： %s | %s' % (air_category, _gf_display_number(aqi_value)))
+        elif aqi_value is not None:
+            weather_lines.append('空气： %s' % _gf_display_number(aqi_value))
+        elif air_category:
+            weather_lines.append('空气： %s' % air_category)
+
+    # 3) 问候块：时段词并进「哈喽哈喽」那句，不再单独占一行
+    greeting_lines = [_gf_greeting_line(period, my_name)]
+    greeting_lines.extend(_gf_advice(tmax, _gf_first(
+        _gf_nested(daytime, 'precipitation', 'type'),
+        _gf_nested(current, 'precipitation', 'type'))))
+    if her_name:
+        hers = _gf_her_line(her_name, tmax)
+        if hers:
+            greeting_lines.append(hers)
+
+    message = '\n\n'.join(('\n'.join(date_lines),
+                           '\n'.join(weather_lines),
+                           '\n'.join(greeting_lines)))
+    if quote:
+        # 一言单独成段（和用户给的示例一致），取不到就整行不出现
+        message += '\n\n' + str(quote).strip()
+    # 曾经在这里拼过一行「[点我有惊喜] ❤️🧡💛💚💙」；用户 2026-09-28 明确要求移除，
+    # 别再往问候里加任何彩蛋尾巴（多一行就多一分像群发的味道）。
+    return message
+
+
+def girlfriend_render(period='auto', moment=None, refresh=False):
+    """取定位 + 天气并渲染：返回 (text, data, error)，error 是一句中文原因。
+
+    发送路径和预览路径共用这一份逻辑，保证「预览里看到什么，发出去就是什么」。
+    """
+    config = _girlfriend_config()
+    moment = moment or datetime.now()
+    if period not in GF_GREETING:
+        period = girlfriend_period(moment)
+    if not str(config.get('host') or '').strip():
+        return None, None, '请先在设置里填写和风天气 Host（形如 https://xxxxx.qweatherapi.com）'
+    if not str(config.get('key') or '').strip():
+        return None, None, '请先在设置里填写和风天气 Key'
+    location, error = _gf_resolve_location(config, refresh=refresh)
+    if error:
+        return None, None, error
+    weather, error = collect_girlfriend_weather(config, location)
+    if error:
+        return None, None, error
+    if not weather.get('current') and not weather.get('daily'):
+        return None, None, '和风天气没有返回可用的天气数据'
+    # 定位结果缓存进配置：下次直接拿坐标，不再打 GeoAPI
+    fields = [('lat', location.get('lat')), ('lon', location.get('lon')),
+              ('tz', location.get('tz'))]
+    if location.get('resolved'):
+        # 只有真的打过 GeoAPI 才写正式名：缓存命中时 location 里的 name/adm 只是回显，
+        # 写回去等于拿用户填的「义乌市」覆盖掉解析出来的「义乌」。
+        fields.append(('city_name', location.get('name')))
+        fields.append(('city_adm', location.get('adm')))
+    dirty = False
+    for field, value in fields:
+        if str(config.get(field) or '').strip() != str(value or '').strip():
+            config[field] = str(value or '')
+            dirty = True
+    if dirty:
+        STATE.set('girlfriend', config)
+    data = dict(weather)
+    data['city'] = str(_gf_first(location.get('name'), config.get('city')) or '').strip()
+    # 定位结果一并回给调用方：面板要用它回填 lat/lon/tz（缓存命中时也要能拿到）
+    data['lat'] = str(location.get('lat') or '')
+    data['lon'] = str(location.get('lon') or '')
+    data['tz'] = str(location.get('tz') or '')
+    text = build_girlfriend_message(config, moment, period, data, quote=fetch_hitokoto())
+    return text, data, None
+
+
+def render_girlfriend_text(period='auto', moment=None, refresh=False):
+    """发送路径用的薄包装：成功返回文案，失败返回 None（调用方自己决定兜底）。"""
+    return girlfriend_render(period=period, moment=moment, refresh=refresh)[0]
+
+
 # ==================== 文昌帝君灵签（每日图文） ====================
 def fetch_wenchang_sign():
     """取一条文昌帝君灵签，返回 {'title','poem','content','pic'}；取不到返回 None。
@@ -1242,11 +2108,18 @@ if (MODE === 'tag') {
   }
   return {list: true, total: items.length, matches: matches0, untagged: 0, state: 'none'};
 }
-var target = norm(TEXT), matches = 0, untagged = 0, newest = null;
+var target = norm(TEXT), matches = 0, untagged = 0, newest = null, newestTop = null;
 for (var i = 0; i < items.length; i++) {
   if (norm(items[i].innerText).indexOf(target) < 0) continue;
   matches++;
-  if (!items[i].hasAttribute(TAG)) { untagged++; newest = items[i]; }
+  if (!items[i].hasAttribute(TAG)) {
+    untagged++;
+    // 真机取证（2026-09-28 probe3）：这个列表是 column-reverse，DOM 里第一条就是**最新**的
+    // （idx=0 top=2776 在视觉最下面，idx=15 top=-397 在视觉最上面）。取「DOM 里最后一个匹配」
+    // 等于取最旧的那条消息，方向和送达状态都会用错人 —— 要按「视觉最靠下（top 最大）」挑。
+    var top = items[i].getBoundingClientRect().top;
+    if (newest === null || top > newestTop) { newest = items[i]; newestTop = top; }
+  }
 }
 var out = {list: true, total: items.length, matches: matches, untagged: untagged, state: 'none', side: 'unknown'};
 if (!newest) return out;
@@ -1260,13 +2133,27 @@ function bubbleSide(el) {
     node = node.parentElement;
     depth++;
   }
+  // 真机取证（2026-09-28 实际 DOM）：抖音把发送方标记挂在**气泡内层**的 contentBox 上，
+  // 我方的 class 是「messageMessageBoxcontentBox messageMessageBoxisFromMe」，
+  // 对方只有「messageMessageBoxcontentBox」。上面那段只看自己和祖先，永远找不到它，
+  // side 恒为 unknown，于是一条明明已经送达的消息被判成「未确认」。
+  // 所以标记必须往下找一层。
+  var inner = el.querySelector('[class*="contentBox"], [class*="ContentBox"]');
+  if (inner) {
+    var icls = ((inner.getAttribute && inner.getAttribute('class')) || '');
+    if (/isFromMe|fromMe|isMe|ownMessage|messageRight|rightMessage/i.test(icls)) return 'self';
+    return 'other';
+  }
+  // 兜底：气泡行往往和列表一样宽（真机 1052 vs 1064），拿整行中心点必然判不出方向。
   var rect = el.getBoundingClientRect();
   var box = list.getBoundingClientRect();
   if (!rect.width || !box.width) return 'unknown';
   var mid = rect.left + rect.width / 2;
   var center = box.left + box.width / 2;
-  if (mid >= center + 20) return 'self';
-  if (mid <= center - 20) return 'other';
+  if (rect.width < box.width * 0.9) {
+    if (mid >= center + 20) return 'self';
+    if (mid <= center - 20) return 'other';
+  }
   return 'unknown';
 }
 out.side = bubbleSide(newest);
@@ -1309,10 +2196,12 @@ def _editor_still_has(editor, text):
     current = _chat_editor_text(editor)
     if not current:
         return False
-    target = (text or '').strip(CHAT_EDITOR_EMPTY_CHARS)
-    if not target:
+    flat_text = _editor_flatten(text)
+    if not flat_text:
         return False
-    return current == target or current in target or target in current
+    flat_current = _editor_flatten(current)
+    # 拉平后再比：Ace 编辑器会在换行前插零宽空格，严格子串比不出「还留着」。
+    return flat_current == flat_text or flat_current in flat_text or flat_text in flat_current
 
 
 # ==================== 图片消息：上传与送达确认 ====================
@@ -1368,6 +2257,31 @@ if (el.hasAttribute('data-spark-style')) {
 return true;
 """
 
+# 抖音的「确认发送文件」浮层。上传图片/文件之后这个模态层会盖住输入框，问一句
+# 「发送给 XXX：xxx.jpg 57.4 KB」，给「取消 / 发送」两个按钮 —— 在它上面按回车
+# 不会发送任何东西。
+#
+# 真机取证（2026-09-28）：当时只对输入框按了回车，于是图片一直挂在浮层里没发出去，
+# 25 秒后被判成「未确认」；紧接着退化发文字时，输入框又被这个模态层挡住，报出
+# 「消息内容没有写进输入框」。两个症状其实是同一个原因。
+CHAT_SEND_FILE_MODAL_JS = r"""
+var mode = arguments[0] || 'check';
+var box = document.querySelector('.MsgInputSendFileModalbox');
+if (!box) return {present: false, mode: mode};
+var sure = box.querySelector('.MsgInputSendFileModalbtnSure');
+var cancle = box.querySelector('.MsgInputSendFileModalbtnCancle');
+var title = box.querySelector('.MsgInputSendFileModaltitleBox');
+var out = {present: true, mode: mode,
+           title: title ? (title.innerText || '').replace(/\s+/g, ' ').trim() : '',
+           has_sure: !!sure, has_cancel: !!cancle};
+if (mode === 'check') return out;
+var target = (mode === 'confirm') ? sure : cancle;
+if (!target) { out.clicked = false; return out; }
+try { target.click(); out.clicked = true; }
+catch (e) { out.clicked = false; out.error = String(e); }
+return out;
+"""
+
 # 上传后输入框上方会出现待发送图片的预览。往上找 5 层再找大图，
 # 小图（表情、头像）不算 —— 这里要的就是「一张真的图片已经挂上去了」。
 CHAT_IMAGE_PREVIEW_JS = r"""
@@ -1413,10 +2327,26 @@ for (var i = 0; i < raw.length; i++) {
   if (!nested) items.push(raw[i]);
 }
 // 表情贴纸、头像、状态图标都很小，只有渲染出来或原始尺寸足够大的才算「一张图片」。
+// 但**头像必须排除**：真机取证（2026-09-28 probe/probe2）每条气泡里都有 36x36 渲染、
+// naturalWidth/Height=168 的头像，只按尺寸判会让「图片气泡」匹配到列表里的每一条消息
+// （实测 16 条里 13 条被算成图片），新图也就永远挑不出「新」的那一条。
+// 注意头像容器 class 是 commonIMAvataravatarContainer，而图片气泡自己带
+// messageMessageBoxhideAvatar —— 所以这里**不能**用 /avatar/i（会把 hideAvatar 一起误伤）。
+function isAvatarImage(el, node) {
+  var cur = node;
+  while (cur && cur !== el) {
+    var cls = (cur.getAttribute && cur.getAttribute('class')) || '';
+    if (/commonIMAvatar|avatarContainer/i.test(cls)) return true;
+    cur = cur.parentElement;
+  }
+  return false;
+}
 function hasPhoto(el) {
   var imgs = el.querySelectorAll('img');
   for (var i = 0; i < imgs.length; i++) {
-    var img = imgs[i], rect = img.getBoundingClientRect();
+    var img = imgs[i];
+    if (isAvatarImage(el, img)) continue;
+    var rect = img.getBoundingClientRect();
     if (rect.width >= 80 && rect.height >= 80) return true;
     if (img.naturalWidth >= 80 && img.naturalHeight >= 80) return true;
   }
@@ -1435,11 +2365,18 @@ if (MODE === 'tag') {
   }
   return {list: true, total: items.length, matches: matches0, untagged: 0, state: 'none'};
 }
-var matches = 0, untagged = 0, newest = null;
+var matches = 0, untagged = 0, newest = null, newestTop = null;
 for (var i = 0; i < items.length; i++) {
   if (!hasPhoto(items[i])) continue;
   matches++;
-  if (!items[i].hasAttribute(TAG)) { untagged++; newest = items[i]; }
+  if (!items[i].hasAttribute(TAG)) {
+    untagged++;
+    // 与文字探针同理：列表是 column-reverse，DOM 里最后一条匹配是最**旧**的。真机就是
+    // 这样取到了 03/21 的一条旧系统消息（side=other），于是新发的图永远判成未送达、
+    // 每张图白等满 25 秒。改成按「视觉最靠下（top 最大）」挑最新那条。
+    var top = items[i].getBoundingClientRect().top;
+    if (newest === null || top > newestTop) { newest = items[i]; newestTop = top; }
+  }
 }
 var out = {list: true, total: items.length, matches: matches, untagged: untagged, state: 'none', side: 'unknown'};
 if (!newest) return out;
@@ -1453,13 +2390,27 @@ function bubbleSide(el) {
     node = node.parentElement;
     depth++;
   }
+  // 真机取证（2026-09-28 实际 DOM）：抖音把发送方标记挂在**气泡内层**的 contentBox 上，
+  // 我方的 class 是「messageMessageBoxcontentBox messageMessageBoxisFromMe」，
+  // 对方只有「messageMessageBoxcontentBox」。上面那段只看自己和祖先，永远找不到它，
+  // side 恒为 unknown，于是一条明明已经送达的消息被判成「未确认」。
+  // 所以标记必须往下找一层。
+  var inner = el.querySelector('[class*="contentBox"], [class*="ContentBox"]');
+  if (inner) {
+    var icls = ((inner.getAttribute && inner.getAttribute('class')) || '');
+    if (/isFromMe|fromMe|isMe|ownMessage|messageRight|rightMessage/i.test(icls)) return 'self';
+    return 'other';
+  }
+  // 兜底：气泡行往往和列表一样宽（真机 1052 vs 1064），拿整行中心点必然判不出方向。
   var rect = el.getBoundingClientRect();
   var box = list.getBoundingClientRect();
   if (!rect.width || !box.width) return 'unknown';
   var mid = rect.left + rect.width / 2;
   var center = box.left + box.width / 2;
-  if (mid >= center + 20) return 'self';
-  if (mid <= center - 20) return 'other';
+  if (rect.width < box.width * 0.9) {
+    if (mid >= center + 20) return 'self';
+    if (mid <= center - 20) return 'other';
+  }
   return 'unknown';
 }
 out.side = bubbleSide(newest);
@@ -1567,6 +2518,33 @@ def _wait_image_preview(editor, timeout=IMAGE_UPLOAD_TIMEOUT):
     return False
 
 
+def _send_file_modal(mode='check'):
+    """读/操作抖音的「确认发送文件」浮层。
+
+    mode='check'   只读，返回 {'present': bool, 'title': 发送给谁, ...}
+    mode='confirm' 点它的「发送」
+    mode='cancel'  点它的「取消」（清场用，避免模态层留在页面上挡输入框）
+
+    浮层不存在时一律返回 {'present': False}，调用方不必区分「读失败」和「没浮层」。
+    """
+    try:
+        return driver.execute_script(CHAT_SEND_FILE_MODAL_JS, mode) or {'present': False}
+    except Exception as exc:
+        return {'present': False, 'error': str(exc)}
+
+
+def _dismiss_send_file_modal(name, reason):
+    """浮层还开着就点掉，返回是否真的点过。
+
+    失败路径上必须调用：只要这个模态层留着，调用方退化发文字时输入框必然写不进去。
+    """
+    if not _send_file_modal('check').get('present'):
+        return False
+    _send_file_modal('cancel')
+    log_event('warn', '发图片', '给「%s」%s，已取消清场' % (name, reason))
+    return True
+
+
 FAILURE_SHOT_KEEP_DAYS = _env_int('SPARK_SHOT_KEEP_DAYS', 7)
 FAILURE_SHOT_MAX_FILES = _env_int('SPARK_SHOT_MAX_FILES', 200)
 
@@ -1664,11 +2642,33 @@ def _confirm_message_delivered(text, before_matches, timeout=SEND_CONFIRM_TIMEOU
 # Python 3.12 会报 SyntaxWarning，未来的版本会直接变成 SyntaxError。
 CHAT_OPEN_NAME_JS = r"""
 var name = arguments[0];
+var expect = (name || '').replace(/\s+/g, ' ').trim();
+// 标题必须取「类名正好是 RightPanelHeadertitle」的那个元素。
+// 以前用 [class*="RightPanelHeadertitle"]，querySelector 会先命中外层容器
+// RightPanelHeadertitleContainer —— 它的 innerText 是「昵称 火花数」（实测「MK空白 699」），
+// 而这里是严格相等比较，于是会话明明已经打开也会被判成「没打开」，然后在这里直接
+// return false 把后面的兜底扫描也短路掉。实测取证：真实页面上 head.title === 'MK空白'
+// 而 head.container.innerText === 'MK空白 699'。带火花的会话因此全部无法确认。
+var exacts = document.querySelectorAll('[class~="RightPanelHeadertitle"]');
+if (exacts.length) {
+  for (var e = 0; e < exacts.length; e++) {
+    var et = (exacts[e].innerText || '').replace(/\s+/g, ' ').trim();
+    if (!et) continue;
+    if (et === expect) return true;
+    // 只容忍尾巴上「空格 + 火花数」这种附加内容（要求有空白分隔，避免把
+    // 昵称自带的数字，比如「小明123」，误当成火花数抹掉而认错人）。
+    if (et.replace(/\s+\d+$/, '').trim() === expect) return true;
+  }
+  return false;
+}
 var head = document.querySelector('[class*="RightPanelHeadertitle"]');
 if (head) {
   var t = (head.innerText || '').replace(/\s+/g, ' ').trim();
-  var expect = (name || '').replace(/\s+/g, ' ').trim();
-  if (t) return t === expect;
+  if (t) {
+    if (t === expect) return true;
+    if (t.replace(/\s+\d+$/, '').trim() === expect) return true;
+    return false;
+  }
 }
 var editor = document.querySelector('[data-slate-editor="true"], [class*="messageEditor"] [contenteditable="true"]');
 if (!editor) return false;
@@ -1768,42 +2768,108 @@ def _open_conversation(name, row_xpath, timeout=8):
     return False, '点击后没能确认已打开与「%s」的会话（已尝试：%s）' % (name, '/'.join(tried) or '无')
 
 
+# 新版抖音聊天框是 Ace 系编辑器（每行一个 div.ace-line），**每一行末尾都会多一个零宽空格**。
+# 于是「写进去了」的严格子串比较（'甲\n乙' in '甲\u200b\n乙'）必然为假：代码以为没写进去，
+# 再换第二种方式写一遍，内容越写越乱，最后报「消息内容没有写进输入框」。
+# 比较前统一抹掉空白与零宽字符。
+_EDITOR_NOISE_RE = re.compile(r'[\s\u00a0\u200b\u200c\u200d\ufeff]+')
+
+
+def _editor_flatten(text):
+    """拉平编辑器文本，只用于比较（抹掉换行、空格、零宽字符）。"""
+    return _EDITOR_NOISE_RE.sub('', text or '')
+
+
+# 编辑器异步落 DOM：写完立刻读 innerText 可能还是旧内容（真机上连读 4 秒都是空），
+# 所以每次写入之后要等结果落定再判成败。机器慢可以调大 SPARK_EDITOR_SETTLE_MS。
+try:
+    _EDITOR_SETTLE_SECONDS = max(0.5, float(os.getenv('SPARK_EDITOR_SETTLE_MS', '3000')) / 1000.0)
+except (TypeError, ValueError):
+    _EDITOR_SETTLE_SECONDS = 3.0
+
+
 def _editor_contains(editor, text):
+    """输入框里是否已经有这段内容（拉平后包含，不是严格子串）。"""
+    target = _editor_flatten(text)
+    if not target:
+        return True
     current = _chat_editor_text(editor)
-    return bool(current) and text in current
+    return bool(current) and target in _editor_flatten(current)
+
+
+def _wait_editor_contains(editor, text, timeout=None):
+    """等编辑器把内容落定后再判断，避免把「还没渲染出来」当成「没写进去」。"""
+    if timeout is None:
+        timeout = _EDITOR_SETTLE_SECONDS
+    deadline = time.time() + max(float(timeout), 0.3)
+    while True:
+        try:
+            if _editor_contains(editor, text):
+                return True
+        except Exception:
+            pass
+        if time.time() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
+def _cdp_insert_text(editor, text):
+    """用 CDP 的 Input.insertText 往输入框写字。
+
+    2026-09-28 真机定案（%TEMP%\\spark-edit\\methods6.json，在刚重载出来的干净编辑器上）：
+    只有这条路能把 4 行签文一字不差地写进去；同一个编辑器上
+    `document.execCommand('insertText')` 会返回 true 却一个字都不写。
+    Input.insertText 只作用于获得焦点的可编辑元素，所以必须先 focus。
+    """
+    driver.execute_script('arguments[0].focus();', editor)
+    driver.execute_cdp_cmd('Input.insertText', {'text': text})
+
+
+def _insert_editor_dom(editor, text):
+    """最兜底的一招：textarea 走原生 value setter，其余非 Slate 元素写 textContent。
+
+    Slate / Ace 这类编辑器由自己的内部模型管理 DOM，直接改 textContent 会把它写坏
+    （真机上就是这样把内容搅乱的），所以对这种元素直接放弃。
+    """
+    driver.execute_script(
+        "var el=arguments[0],v=arguments[1];"
+        "var tag=(el.tagName||'').toLowerCase();"
+        "if(tag==='textarea'){"
+        "  var d=Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value');"
+        "  if(d&&d.set){d.set.call(el,v);}"
+        "}else if(!el.getAttribute('data-slate-editor')){"
+        "  el.textContent=v;"
+        "}else{return false;}"
+        "el.dispatchEvent(new Event('input',{bubbles:true}));"
+        "el.dispatchEvent(new Event('change',{bubbles:true}));",
+        editor, text)
 
 
 def _type_into_editor(editor, text):
-    """把内容写进聊天输入框（contenteditable / textarea 都能用）。"""
+    """把内容写进聊天输入框（contenteditable / textarea 都能用）。
+
+    顺序按真机实测的可靠度排：CDP Input.insertText → 老的 execCommand → DOM 兜底。
+    故意**不用** editor.send_keys(text)：send_keys 碰到 '\\n' 会真按一次回车，
+    而这条消息是在下一行才用回车提交的 —— 那会把半条消息提前发出去。
+    """
     target = (text or '').strip()
-    try:
-        driver.execute_script(CHAT_INSERT_JS, editor, text)
-    except Exception:
-        pass
-    if _editor_contains(editor, target):
+    if not target:
         return True
-    try:
-        editor.send_keys(text)
-    except Exception:
-        pass
     if _editor_contains(editor, target):
-        return True
-    try:
-        driver.execute_script(
-            "var el=arguments[0],v=arguments[1];"
-            "var tag=(el.tagName||'').toLowerCase();"
-            "if(tag==='textarea'){"
-            "  var d=Object.getOwnPropertyDescriptor(window.HTMLTextAreaElement.prototype,'value');"
-            "  if(d&&d.set){d.set.call(el,v);}"
-            "}else if(!el.getAttribute('data-slate-editor')){"
-            "  el.textContent=v;"  # Slate 编辑器由自己的模型管理 DOM，直接改 textContent 会把它写坏
-            "}else{return false;}"
-            "el.dispatchEvent(new Event('input',{bubbles:true}));"
-            "el.dispatchEvent(new Event('change',{bubbles:true}));",
-            editor, text)
-    except Exception:
-        pass
-    return _editor_contains(editor, target)
+        return True                       # 已经在了，绝不重复写
+    attempts = (
+        ('cdp-input', lambda: _cdp_insert_text(editor, target)),
+        ('execCommand', lambda: driver.execute_script(CHAT_INSERT_JS, editor, target)),
+        ('dom-fallback', lambda: _insert_editor_dom(editor, target)),
+    )
+    for _label, action in attempts:
+        try:
+            action()
+        except Exception:
+            continue
+        if _wait_editor_contains(editor, target):
+            return True
+    return False
 
 
 _FRIEND_KEY_RE = re.compile(r'^[A-Za-z0-9_.:-]{1,96}$')
@@ -1819,8 +2885,24 @@ var rows = document.querySelectorAll('[data-e2e="conversation-item"], .conversat
 var out = [];
 for (var i = 0; i < rows.length; i++) {
   var row = rows[i];
+  // 真机 DOM（2026-09-28 在真实会话页实测 49 条会话，结构如下）：
+  //   <div class="conversationConversationItemtitleWrapper">
+  //     <div class="conversationConversationItemtitle">昵称</div>
+  //     <div class="ConversationItemTagNextToTitlewrapper">
+  //       <div class="ConversationItemTagNextToTitleleft"></div>             <- 火花徽章（有火花时才有文字）
+  //       <div class="ConversationItemTagNextToTitleleft">
+  //         <div class="ConversationItemTagNextToTitletimeStr">03/17</div>   <- 最后一条消息的时间
+  //       </div>
+  //     </div>
+  //   </div>
+  // 昵称只能取最里层那个 Itemtitle。以前用的 [class*="title"] 会命中外层 Wrapper
+  // （它的 class 里同样含 "title" 子串，而且文档顺序更靠前），于是昵称被拼成
+  // 「昵称 + 火花徽章 + 时间」—— 用户看到的「火花数量显示在昵称里」就是这个。
+  // 而且那个时间是「最后一条消息的日期」，天天在变，连任务/好友匹配都会跟着失效。
   var name = '';
-  var nameEl = row.querySelector('[class*="conversationName"], [class*="ConversationName"], [class*="title"]');
+  var nameEl = row.querySelector('[class*="Itemtitle"]:not([class*="Wrapper"])')
+            || row.querySelector('[class*="ConversationName"]')
+            || row.querySelector('[class*="conversationName"]');
   if (nameEl) name = (nameEl.innerText || '').replace(/\s+/g, ' ').trim();
   if (!name) {
     var lines = (row.innerText || '').split('\n').map(function (part) { return part.trim(); }).filter(Boolean);
@@ -1829,9 +2911,21 @@ for (var i = 0; i < rows.length; i++) {
   if (!name) continue;
   var img = row.querySelector('img');
   var avatar = img ? (img.getAttribute('src') || '') : '';
+  // 火花徽章和时间挤在同一个「昵称旁边的 tag 容器」里：容器文字减掉时间文字，
+  // 剩下的才是火花（没有火花的会话里那个 left 是空 div，这里自然得到空串）。
   var fire = '';
-  var fireEl = row.querySelector('[class*="fire"], [class*="Fire"], [class*="spark"]');
-  if (fireEl) fire = (fireEl.innerText || '').replace(/\s+/g, ' ').trim();
+  var timeEl = row.querySelector('[class*="timeStr"]');
+  var timeText = timeEl ? (timeEl.innerText || '').replace(/\s+/g, ' ').trim() : '';
+  var tagEl = row.querySelector('[class*="TagNextToTitle"]');
+  if (tagEl) {
+    var tagText = (tagEl.innerText || '').replace(/\s+/g, ' ').trim();
+    if (timeText) tagText = tagText.split(timeText).join(' ').replace(/\s+/g, ' ').trim();
+    fire = tagText;
+  }
+  if (!fire) {
+    var fireEl = row.querySelector('[class*="fire"], [class*="Fire"], [class*="spark"]');
+    if (fireEl) fire = (fireEl.innerText || '').replace(/\s+/g, ' ').trim();
+  }
   var rawId = row.getAttribute('data-id') || row.getAttribute('data-conversation-id') || row.id || '';
   var key = hashKey((rawId || (name + '|' + avatar)) + '#' + i);
   row.setAttribute('data-spark-key', key);
@@ -1939,8 +3033,45 @@ class Douyin:
                 item['name'], item['avatar'], item['fire'], ambiguous=item['name'] in ambiguous))
         return temp
 
-    def _scroll_until_friend(self, name):
-        """把目标会话滚进当前画面再定位。虚拟列表滚出视口后，旧位置选择器会失效。"""
+    def known_names(self):
+        """这次读到的全部会话名（按出现顺序去重）。
+
+        friend_catalog 是滚动过程中见过的所有会话（本机两百多条），
+        friends_xpath_list 只是「当前画面」里那几十行 —— 报「共读到 N 个」时必须用前者，
+        否则会报出一个比用户实际会话数小得多的数字，看着像读错了。
+        """
+        names = []
+        for item in self.friend_catalog or []:
+            item_name = item.get('name') if isinstance(item, dict) else None
+            if item_name and item_name not in names:
+                names.append(item_name)
+        if not names:
+            names = list((self.friends_xpath_list or {}).keys())
+        return names
+
+    def locate_friend(self, name):
+        """定位会话行，返回可点击的 xpath；找不到返回 None。
+
+        会话列表是虚拟滚动：Updara_FrinderList 只给当前画面里的行建索引，
+        滚过去的那批会话只有名字、没有位置。所以索引里没有就从顶部滚下去找一遍
+        （_scroll_until_friend）—— 发消息一直这么做，预检漏了这一步，
+        于是出现「好友列表里明明有、预检却说会话列表里没有」。
+        """
+        if not name:
+            return None
+        row_xpath = (self.friends_xpath_list or {}).get(name)
+        if row_xpath is None and hasattr(self, '_scroll_until_friend'):
+            self._scroll_until_friend(name)
+            row_xpath = (self.friends_xpath_list or {}).get(name)
+        return row_xpath
+
+    def _scroll_until_friend(self, name, max_steps=60):
+        """把目标会话滚进当前画面再定位。虚拟列表滚出视口后，旧位置选择器会失效。
+
+        以前固定只滚 8 步就放弃，而本机的会话列表有两百多条、一屏只挂几十行，
+        8 步到不了底 —— 于是大量「好友列表里看得到、发送/预检却说没有」。
+        现在一直滚到「找到」或「滚不动（到底了）」为止，用 max_steps 兜住时间上限。
+        """
         if not name:
             return
         try:
@@ -1948,7 +3079,7 @@ class Douyin:
         except Exception:
             return
         time.sleep(0.2)
-        for _ in range(8):
+        for _ in range(max_steps):
             batch = self._read_visible_friends()
             unique, ambiguous, _cleaned = group_friend_rows(batch)
             if name in ambiguous:
@@ -2038,22 +3169,55 @@ class Douyin:
             log_event('error', '发图片', '给「%s」上传图片失败：%s' % (name, reason))
             return TrueString(False, '%s。这张图片没有发送' % reason, status='failed')
 
-        # 没等到预览不中止：部分版式下预览不在这个 DOM 子树里，判不到不等于图片没挂上。
-        # 真正的判据是发送后消息列表里有没有出现新的图片气泡。
-        if not _wait_image_preview(editor):
-            log_event('warn', '发图片', '给「%s」上传图片后没等到预览，继续尝试发送' % name)
-
+        # 给现存气泡打标记必须在图片真的发出去之前，否则新气泡会被算进 before。
         before = _chat_image_probe('tag')
         before_matches = before.get('matches', 0)
-        if paced:
-            human_pause(0.2, 0.8)
-        try:
-            editor.send_keys(Keys.ENTER)
-        except Exception:
-            pass
+
+        # 上传后有两种界面，必须先分清再动手：
+        #   A) 抖音弹出「确认发送文件」浮层（当前版本的行为）—— 在它上面按回车毫无作用，
+        #      必须先点浮层里的「发送」，否则图片永远发不出去，浮层还会挡住后面的文字输入；
+        #   B) 图片直接挂在输入区（老行为）—— 回车发送。
+        modal = _send_file_modal('check')
+        if not modal.get('present'):
+            # 没等到预览不中止：部分版式下预览不在这个 DOM 子树里，判不到不等于图片没挂上。
+            # 真正的判据是发送后消息列表里有没有出现新的图片气泡。
+            if not _wait_image_preview(editor):
+                log_event('warn', '发图片', '给「%s」上传图片后没等到预览，继续尝试发送' % name)
+            # 预览等完之后再看一眼浮层：它是模态层，只要它还在，回车就是白按。
+            modal = _send_file_modal('check')
+
+        modal_note = None
+        if modal.get('present'):
+            if not _send_file_modal('confirm').get('clicked'):
+                _send_file_modal('cancel')
+                log_event('error', '发图片',
+                          '给「%s」遇到抖音的「确认发送文件」浮层，但点不到它的「发送」按钮' % name)
+                self.last_send_detail = {
+                    '确认方式': '卡在抖音的「确认发送文件」浮层',
+                    '图片': os.path.basename(path or ''),
+                    '浮层': modal.get('title', ''),
+                }
+                return TrueString(False,
+                                  '图片没有发送：抖音弹出了「确认发送文件」浮层，但没能点到它的'
+                                  '「发送」按钮。这张图片没有发送，请在抖音里手动确认后重试',
+                                  status='failed')
+            modal_note = modal.get('title') or '发送文件'
+            log_event('info', '发图片',
+                      '给「%s」已点掉抖音的「确认发送文件」浮层：%s' % (name, modal_note))
+        else:
+            if paced:
+                human_pause(0.2, 0.8)
+            try:
+                editor.send_keys(Keys.ENTER)
+            except Exception:
+                pass
         result, detail = _confirm_message_delivered(
             None, before_matches, timeout=IMAGE_CONFIRM_TIMEOUT,
             probe_fn=lambda: _chat_image_probe('check'))
+        # 兜底：浮层如果还开着（点了发送但抖音没关它，或者走了别的分支），先取消再往下走 ——
+        # 只要它留着，调用方退化发文字时输入框必然写不进去。
+        _dismiss_send_file_modal(name, '发送图片后「确认发送文件」浮层仍未关闭')
+
         image_name = os.path.basename(path or '')
         if result == 'success':
             self.last_send_detail = {
@@ -2062,6 +3226,8 @@ class Douyin:
                 '图片': image_name,
                 '列表气泡数': detail.get('probe', {}).get('total'),
             }
+            if modal_note:
+                self.last_send_detail['确认步骤'] = modal_note
             return TrueString(True, None)
 
         # 这里**不**像文字那样换触发方式重试：图片一旦挂在输入区，
@@ -2116,21 +3282,12 @@ class Douyin:
         if not self.friends_xpath_list and not self.friend_catalog:
             return TrueString(False, '没读到会话列表：可能未登录、会话列表未加载出来，或列表选择器已失效',
                               status='failed')
-        row_xpath = (self.friends_xpath_list or {}).get(name)
-        if row_xpath is None and hasattr(self, '_scroll_until_friend'):
-            self._scroll_until_friend(name)
-            row_xpath = (self.friends_xpath_list or {}).get(name)
+        row_xpath = self.locate_friend(name)
         if name in (self.friend_ambiguous or set()):
             return TrueString(False, '有多位叫「%s」的会话，无法确定发给谁，这次没有发送' % name,
                               status='failed')
         if row_xpath is None:
-            names = []
-            for item in self.friend_catalog or []:
-                item_name = item.get('name')
-                if item_name and item_name not in names:
-                    names.append(item_name)
-            if not names:
-                names = list((self.friends_xpath_list or {}).keys())
+            names = self.known_names()
             return TrueString(
                 False,
                 '会话列表里没有「%s」（共读到 %d 个会话，例如：%s）。请在好友列表里刷新后重新选择。'
@@ -2313,7 +3470,13 @@ APP_LOG_FILE = os.path.join(LOG_DIR, 'app.log')
 APP_LOG_MAX_BYTES = 2 * 1024 * 1024
 APP_LOG_KEEP_LINES = 2000
 APP_LOG_LEVELS = ('success', 'info', 'warn', 'error')
-APP_LOG_CATEGORIES = ('浏览器', '登录', '验证', '发消息', '定时任务', '任务管理', '系统')
+# 信息日志页「分类」下拉的数据源。这个元组必须覆盖所有 log_event 用到的分类：
+# 以前只列了 8 个，实际用到 19 个，导致「通知」「一言」「灵签」这些日志在页面上
+# 根本筛不出来（用户报「检查下消息通知有没有bug」时发现的）。
+# 新增测试 test_every_log_category_is_selectable 会用 AST 扫 log_event 调用点兜住这件事。
+APP_LOG_CATEGORIES = ('浏览器', '登录', '验证', '发消息', '定时任务', '任务管理', '消息记录', '系统',
+                      '通知', '发图片', '灵签', '一言', '女朋友模式', '试发', '预检', '风控',
+                      '账号', '好友列表', '清理')
 _app_log_lock = threading.Lock()
 
 
@@ -2478,6 +3641,34 @@ def _apply_email_config(payload, config):
     return None
 
 
+def _notify_worker(config, webhook, email_on, title, content):
+    """通知线程真正干活的那一段。
+
+    单独抽成模块级函数有两个原因：
+      1. 整段包了 try/except：推送 / 邮件里任何一个没预料到的异常，以前都会让 daemon
+         线程直接死掉 —— 这条通知等于从来没发过，日志里也一个字都没有（notifier.push
+         曾经对 `[]` 这种合法 JSON 抛 AttributeError，就是这么静默消失的）。
+      2. 抽出来之后测试可以直接调用它并断言「异常确实进了日志」；跑在线程里就只能
+         靠 sleep 抢时序，那是不稳定的测试。
+    推送地址和邮箱密码都属于凭据，绝不写进日志。
+    """
+    try:
+        if webhook:
+            ok, detail = push(config.get('url'), title, content, allow_private=ALLOW_PRIVATE_PUSH)
+            if ok:
+                log_event('info', '通知', '已推送：%s' % title)
+            else:
+                log_event('warn', '通知', '推送失败：%s' % detail)
+        if email_on:
+            ok, detail = send_email(_email_settings(config), title, content, allow_private=ALLOW_PRIVATE_PUSH)
+            if ok:
+                log_event('info', '通知', '已发邮件：%s' % title)
+            else:
+                log_event('warn', '通知', '邮件发送失败：%s' % detail)
+    except Exception as exc:
+        log_event('error', '通知', '通知发送异常：%s' % exc)
+
+
 def notify(title, content, force=False):
     """发一条消息通知（异步，不阻塞发送流程）。
 
@@ -2494,21 +3685,8 @@ def notify(title, content, force=False):
     if not webhook and not email_on:
         return False
 
-    def _worker():
-        if webhook:
-            ok, detail = push(config.get('url'), title, content, allow_private=ALLOW_PRIVATE_PUSH)
-            if ok:
-                log_event('info', '通知', '已推送：%s' % title)
-            else:
-                log_event('warn', '通知', '推送失败：%s' % detail)
-        if email_on:
-            ok, detail = send_email(_email_settings(config), title, content, allow_private=ALLOW_PRIVATE_PUSH)
-            if ok:
-                log_event('info', '通知', '已发邮件：%s' % title)
-            else:
-                log_event('warn', '通知', '邮件发送失败：%s' % detail)
-
-    threading.Thread(target=_worker, daemon=True).start()
+    threading.Thread(target=_notify_worker,
+                     args=(config, webhook, email_on, title, content), daemon=True).start()
     return True
 
 
@@ -2591,6 +3769,7 @@ DEFAULT_STATE = {
     'send_history': {},      # 发送记账：{'日期|好友': {'status','at','text'}}
     'retry_queue': {},       # 当日补发队列：{'date','due_at','done','items'}
     'manual_retries': {},    # 人工重发标记：{'日期|好友': 日期}
+    'girlfriend': dict(GF_DEFAULT_CONFIG),   # 女朋友模式配置（和风天气 Host/Key/城市…）
 }
 STATE = StateStore(STATE_FILE, defaults=DEFAULT_STATE)
 
@@ -2713,7 +3892,8 @@ _scheduler_stop = threading.Event()
 _scheduler_started = False
 _send_queue = queue.Queue()
 TICK_INTERVAL_SECONDS = 5
-KIND_LABELS = {'task': '定时', 'catchup': '补跑', 'retry': '当日补发', 'confirm': '人工重发'}
+KIND_LABELS = {'task': '定时', 'catchup': '补跑', 'retry': '当日补发', 'confirm': '人工重发',
+               'manual': '手动发送', 'test': '试发'}
 
 
 def _enqueue_send(name, text, kind='task', task_id=None):
@@ -2732,7 +3912,7 @@ def _persist_tasks():
     STATE.set('tasks', items)
 
 
-def _register_task(play_time, name, text, task_id=None, mark_today=False, sign=False):
+def _register_task(play_time, name, text, task_id=None, mark_today=False, sign=False, source=None):
     """登记一条定时任务（内存 + 落盘），返回任务ID。
 
     task_id 用随机串，不再用「时间_好友名」拼：好友名里带下划线或后缀相同时
@@ -2740,6 +3920,7 @@ def _register_task(play_time, name, text, task_id=None, mark_today=False, sign=F
     mark_today=True 用于「新建/改时间时今天这个点已经过去」的场景：直接记为今天已跑，
     免得刚建完任务就立刻补发一条，用户完全没有预期。
     sign=True 表示这条任务每天发「文昌帝君灵签」图文（签图 + 当天签文）。
+    source='hitokoto' 表示这条任务的正文在发送时现取一句一言（写下来的 text 只当兜底）。
     """
     task_id = task_id or uuid.uuid4().hex[:12]
     meta = {
@@ -2748,6 +3929,8 @@ def _register_task(play_time, name, text, task_id=None, mark_today=False, sign=F
         'text': text,
         # 灵签开关按任务存：同一个人可以今天发签文、明天改回普通文案
         'sign': bool(sign),
+        # 内容来源也按任务存：'text'（默认）用上面的文案池，'hitokoto' 发送时现取一句
+        'source': _normalise_task_source(source),
         # last_run_date：今天是否已经跑过（对外展示 + 老字段兼容）
         # last_planned_date：已发出的那一次属于哪一天（跨午夜任务靠它判断「这次做过没有」）
         'last_run_date': today_str() if mark_today else None,
@@ -2782,6 +3965,8 @@ def restore_tasks():
                 'text': item.get('text') or '',
                 # 老 state.json 没有 sign 字段：缺省就是普通文字任务
                 'sign': bool(item.get('sign')),
+                # 老 state.json 没有 source 字段：缺省就是「用自己写的文案」
+                'source': _normalise_task_source(item.get('source')),
                 'last_run_date': item.get('last_run_date'),
                 # 老 state.json 没有这个字段：留 None，_occurrence_done 会自动退回
                 # 按 last_run_date 判断，不会因为缺字段就把当天重发一遍
@@ -2837,21 +4022,49 @@ def run_scheduled_send(name, text=None, kind='task', task_id=None):
         log_event('warn', '定时任务', '跳过「%s」：仍在使用默认密码' % name)
         return 'skipped:仍在使用默认密码'
     human_pause(1.0, 15.0)
-    sign_flag = bool(((task_meta.get(task_id) or {}).get('sign'))) if task_id else False
+    task_now = (task_meta.get(task_id) or {}) if task_id else {}
+    sign_flag = bool(task_now.get('sign'))
     sign_data = fetch_wenchang_sign() if sign_flag else None
     if sign_flag and not sign_data:
         # 签文取不到就退化成普通文案：定时任务的第一目标是「火花不能断」，
         # 不能因为第三方接口挂了就整天不发。
         log_event('warn', '定时任务', '给「%s」取文昌帝君灵签失败，本次只发文字' % name)
+    # 内容来源不是「文字池」的任务：每次发送前现取 / 现渲染一份。取不到就走下面的
+    # 兜底链，绝不返回空内容 —— 三方接口挂了不是「今天不发」的理由。
+    source_now = str(task_now.get('source') or 'text')
+    hitokoto_text = None
+    if source_now == 'hitokoto':
+        hitokoto_text = fetch_hitokoto()
+        if not hitokoto_text:
+            log_event('warn', '一言', '给「%s」取一言失败，本次改用任务自己的文案' % name)
+    # 女朋友模式：按发送时刻的时段现渲染一条天气问候（没填 Host/Key、城市查不到、
+    # 天气接口挂了都会返回 None），同样退回任务自己写的文案。
+    girlfriend_text = None
+    if source_now == 'girlfriend':
+        girlfriend_text = render_girlfriend_text()
+        if not girlfriend_text:
+            log_event('warn', '女朋友模式', '给「%s」渲染天气问候失败，本次改用任务自己的文案' % name)
     # 正文取法（和面板上的说明、以及 /Time/test 的试发保持一致）：
-    #   灵签任务 + 文案留空  -> 用当天签文
-    #   灵签任务 + 写了文案  -> 用用户写的（签图照发；旧实现是签文覆盖它，等于把用户写的字丢了）
-    #   普通任务             -> 文案池渲染 / 留空现取一条
+    #   一言任务 + 取到了      -> 用取到的那句话
+    #   女朋友模式 + 渲染成功  -> 用渲染出来的天气问候
+    #   灵签任务 + 文案留空    -> 用当天签文
+    #   灵签任务 + 写了文案    -> 用用户写的（签图照发；旧实现是签文覆盖它，等于把用户写的字丢了）
+    #   普通任务               -> 文案池渲染 / 留空现取一条
     content = ''
-    if sign_data and not (text or '').strip():
+    if hitokoto_text:
+        content = hitokoto_text
+    if not content and girlfriend_text:
+        content = girlfriend_text
+    if not content and sign_data and not (text or '').strip():
         content = render_sign_text(sign_data)
     if not content:
-        content = _resolve_text(text)
+        if source_now in ('hitokoto', 'girlfriend'):
+            # 现取失败时的退化链：任务自己的文案 -> 本地兜底。
+            # 这里刻意不走 _resolve_text：用户点名要的是「一言 / 女朋友模式」，接口挂了就
+            # 老老实实用他自己写的字兜底，别背着他换成另一个来源（名言接口）。
+            content = render_message(text) or random.choice(FALLBACK_MESSAGES)
+        else:
+            content = _resolve_text(text)
     image_path = None
     if sign_data and sign_data.get('pic'):
         image_path, image_error = download_image(sign_data['pic'])
@@ -2879,16 +4092,16 @@ def run_scheduled_send(name, text=None, kind='task', task_id=None):
         return 'skipped:%s' % blocked
     with browser_lock:
         # 发送前先记 'unknown'：万一进程在中途被杀，当天也不会重复发
-        _history_mark(name, record_text, 'unknown')
+        _history_mark(name, record_text, 'unknown', kind=kind)
         try:
             out = Douyin.Send_Frinder(douyin, name, content, paced=True, image=image_path)
         except Exception as exc:
-            _history_mark(name, record_text, 'unknown', exc)
+            _history_mark(name, record_text, 'unknown', exc, kind=kind)
             log_event('error', '定时任务', '给「%s」自动发消息异常' % name, exc)
             notify('自动续火花失败', '给「%s」自动发消息时出错：%s' % (name, exc), force=True)
             return 'unknown:%s' % exc
     if out is not None and out.is_bool:
-        _history_mark(name, record_text, 'success')
+        _history_mark(name, record_text, 'success', kind=kind)
         detail = dict(getattr(douyin, 'last_send_detail', None) or {})
         detail['内容'] = record_text
         log_event('success', '定时任务', '已自动发送给「%s」' % name,
@@ -2902,7 +4115,7 @@ def run_scheduled_send(name, text=None, kind='task', task_id=None):
                                             '签图没有送出（%s）' % image_note if image_lost else ''))
         return 'success'
     status, reason = _send_outcome(out)
-    _history_mark(name, record_text, status, reason)
+    _history_mark(name, record_text, status, reason, kind=kind)
     # 日志里带上归类（transient / permanent / authentication / rate_limit），
     # 排查时一眼能看出「是页面结构变了，还是被风控了，还是登录掉了」
     log_event('error', '定时任务', '给「%s」自动发消息失败（%s）' % (name, classify_error(reason)), reason)
@@ -3241,12 +4454,14 @@ def stop_scheduler():
 
 
 def _reset_browser_state():
-    global init, Login_is_bool, driver, douyin
+    global init, Login_is_bool, driver, douyin, _stealth_injected
     old_driver = driver
     driver = None
     douyin = None
     init = False
     Login_is_bool = False
+    # 驱动没了，注入过的那份脚本自然也没了 —— 下次初始化要重新注入并重新统计。
+    _stealth_injected = False
     # 心跳也要一起清：否则 probe=False 的调用方会拿着上一次的成功心跳
     # 认为「浏览器还活着」，而实际上驱动已经被我们 quit 掉了。
     _browser_heartbeat['ok'] = False
@@ -3612,8 +4827,8 @@ def human_pause(low, high):
 # ==================== 发送记账（防重复发送） ====================
 # 参考开源项目的做法：发送前先记账，成功再改成 success；结果不确定的当天也不再重发 ——
 # 「报失败但其实已送达」时再补一次，对方就会收到两条。
-# 判定逻辑（键的构造、作用域语义、冷却时间）都在 spark_core，这里只负责读写 state.json。
-SEND_COOLDOWN_SECONDS = 90
+# 判定逻辑（键的构造、作用域语义）都在 spark_core，这里只负责读写 state.json。
+# 手动发送不再有「冷却时间」这类拦人机制，只有定时链路还会按天拦重复。
 HISTORY_KEEP_DAYS = 7
 
 
@@ -3634,10 +4849,11 @@ def _history_key(name, text=None):
 _history_lock = threading.RLock()
 
 
-def _history_mark(name, text, status, detail=None):
+def _history_mark(name, text, status, detail=None, kind=None):
     with _history_lock:
         history = history_clean(STATE.get('send_history') or {}, today_str(), HISTORY_KEEP_DAYS)
-        history[_history_key(name)] = make_history_record(status, text=text, detail=detail)
+        history[_history_key(name)] = make_history_record(
+            status, text=text, detail=detail, kind=kind)
         return STATE.set('send_history', history)
 
 
@@ -3652,9 +4868,15 @@ def send_guard(name, text, scope='task'):
     """发送前的重复检查，返回阻止原因（None = 放行）。
 
     scope='task'   定时 / 补跑 / 补发：当天已经发过（含结果不确定）就跳过，绝不重复打扰对方；
-    scope='manual' 手动发送：只做短冷却，防手滑连点。
+    scope='manual' 手动发送：一律放行。
+
+    手动发送不再做任何重复拦截（原来是 90 秒冷却）：面板上那一下是人自己点的，
+    再点一次就是想再发一次；把它拦下来只会让人以为程序坏了。需要防重复的是定时
+    那条链路，所以 task 作用域的「当天已发过就跳过」保持不变。
     """
-    reason = guard_decision(_history_recent(name), scope, cooldown_seconds=SEND_COOLDOWN_SECONDS)
+    if scope == 'manual':
+        return None
+    reason = guard_decision(_history_recent(name), scope)
     if reason:
         return '「%s」：%s' % (name, reason)
     return None
@@ -3744,7 +4966,7 @@ def _clear_login_failures(ip):
 
 
 def ensure_browser_ready():
-    global init, driver, douyin, Login_is_bool
+    global init, driver, douyin, Login_is_bool, _browser_version
     with browser_lock:
         if init and _driver_alive():
             return None
@@ -3759,7 +4981,19 @@ def ensure_browser_ready():
             options = build_chrome_options()
             driver = webdriver.Chrome(service=service, options=options) if service else webdriver.Chrome(options=options)
             driver.set_window_size(1400, 3200)
+            try:
+                _browser_version = str((driver.capabilities or {}).get('browserVersion') or '')
+            except Exception:
+                _browser_version = ''
+            # 必须在这里注入：脚本要赶在抖音页面自己的 JS 之前挂上去。
+            # 失败不阻止初始化（能登录能发送），但安全中心会报警。
+            _inject_stealth_js(driver)
             driver.get('https://www.douyin.com/chat?isPopup=1 ')
+            # 刚建出来的浏览器当然是活的，但 _driver_alive(probe=False) 只读心跳，
+            # 而心跳要等下一轮调度 tick 才会被刷新。中间这段时间 /healthz 会误报
+            # browser_ready=false，安全中心也会误报「会话已失效」。
+            # 此刻正持着 browser_lock，可以安全地真碰一次浏览器把心跳立起来。
+            _driver_alive(probe=True)
             douyin = Douyin(driver)
             init = True
             Login_is_bool = _detect_logged_in_state()
@@ -4247,7 +5481,7 @@ def GetFrindesList(authorization: str = Header(None)):
 
 
 def _send_now(name, text, image_path=None, record_text=None, scope='manual',
-              category='发消息', success_text='发送成功'):
+              category='发消息', success_text='发送成功', kind='manual'):
     """真实执行一次发送并按（日期 + 好友）记账，返回接口响应 dict。
 
     手动发送和「立即试发」（/Time/test）走的是同一段代码：差别只在 scope
@@ -4266,20 +5500,20 @@ def _send_now(name, text, image_path=None, record_text=None, scope='manual',
     if blocked:
         log_event('warn', category, '已拦住一次重复发送', {'好友': name, '原因': blocked})
         return {'code': 404, 'data': blocked}
-    _history_mark(name, record_text, 'unknown')
+    _history_mark(name, record_text, 'unknown', kind=kind)
     try:
         out = Douyin.Send_Frinder(douyin, name, text or '', image=image_path)
     except Exception as exc:
-        _history_mark(name, record_text, 'unknown', exc)
+        _history_mark(name, record_text, 'unknown', exc, kind=kind)
         log_event('error', category, '给「%s」发送时出错' % name, exc)
         return {'code': 404, 'data': '发送时出错: %s' % exc_text(exc)}
     if out is None:
         # 兜底：Send_Frinder 任何分支都应返回 TrueString，这里保证接口层不会 500
-        _history_mark(name, record_text, 'unknown', '无返回结果')
+        _history_mark(name, record_text, 'unknown', '无返回结果', kind=kind)
         log_event('error', category, '给「%s」发送没有返回结果' % name)
         return {'code': 404, 'data': '发送没有返回结果（内部异常）'}
     if out.is_bool:
-        _history_mark(name, record_text, 'success')
+        _history_mark(name, record_text, 'success', kind=kind)
         detail = dict(getattr(douyin, 'last_send_detail', None) or {})
         detail['内容'] = record_text
         log_event('success', category, '已发送给「%s」' % name,
@@ -4287,7 +5521,7 @@ def _send_now(name, text, image_path=None, record_text=None, scope='manual',
         return {'code': 200, 'data': success_text}
     # 结果不确定时记 'unknown'：当天不再自动重发，避免对方收到两条。
     # 归类规则同样走 spark_core（见 run_scheduled_send 处的注释）。
-    _history_mark(name, record_text, send_status_from_reason(out.string), out.string)
+    _history_mark(name, record_text, send_status_from_reason(out.string), out.string, kind=kind)
     log_event('error', category, '给「%s」发送失败' % name, out.string)
     return {'code': 404, 'data': out.string}
 
@@ -4331,6 +5565,30 @@ def Send(payload: dict = Body(default=None), name: str = None, text: str = None,
             text = render_sign_text(sign_data)
         if not image_url:
             image_url = sign_data.get('pic') or ''
+    # source='hitokoto'：正文改成「现取一句一言」。
+    # 这里严格比字符串、不做 _bool_flag 那种宽松解析：写成 'yes'/1 这种值时静默退化成
+    # 普通文案，用户会以为自己发的是一言，其实是自己填的那句 —— 宁可不生效也不要骗人。
+    # 放在灵签之后，是为了让「取到了」优先于签文/用户文案，和定时任务的优先级一致。
+    if str(body.get('source') or '').strip().lower() == 'hitokoto':
+        hitokoto_text = fetch_hitokoto()
+        if hitokoto_text:
+            text = hitokoto_text
+        else:
+            log_event('warn', '一言', '给「%s」取一言失败，本次退回你填写的文案' % (name or '好友'))
+            if not (text or '').strip() and not image_url:
+                # 兜底链的最后一级：一句话都取不到也得有内容，不能因此整条不发
+                text = random.choice(FALLBACK_MESSAGES)
+    # source='girlfriend'：正文改成「按当前时段渲染的天气问候」（面板上的手动发送也支持）。
+    # 口径与定时任务、/Api/Girlfriend/Preview 完全一致：渲染失败就退回用户填的文案。
+    if str(body.get('source') or '').strip().lower() == 'girlfriend':
+        girlfriend_text = render_girlfriend_text()
+        if girlfriend_text:
+            text = girlfriend_text
+        else:
+            log_event('warn', '女朋友模式',
+                      '给「%s」渲染天气问候失败，本次退回你填写的文案' % (name or '好友'))
+            if not (text or '').strip() and not image_url:
+                text = random.choice(FALLBACK_MESSAGES)
     if not name or (not (text or '').strip() and not image_url):
         # 允许「只发一张图」：文字和图片是两条独立消息，图片本身就能当内容。
         return {'code': 400, 'data': '好友名和消息内容都要填'}
@@ -4351,6 +5609,134 @@ def Send(payload: dict = Body(default=None), name: str = None, text: str = None,
     # 记账文本带上图片标记：发送记录里一眼能看出这条是图文，而不是只看到签文正文。
     record_text = image_record_text(text, sign_label) if image_path else (text or '')
     return _send_now(name, text, image_path=image_path, record_text=record_text, scope='manual')
+
+
+@app.get('/Api/Hitokoto/Preview')
+def HitokotoPreview(authorization: str = Header(None)):
+    """取一句一言给面板预览（「取一条试试」按钮），不发送任何消息。
+
+    这里**不加** @serialized：本函数只发一个外网 HTTP 请求，不排队、不占会话，
+    挂上串行锁只会让发送高峰期连预览都点不动。
+    """
+    auth_err = require_auth(authorization)
+    if auth_err:
+        return auth_err
+    text = fetch_hitokoto()
+    if not text:
+        return {'code': 400, 'data': '一言接口暂时取不到内容，请稍后再试'}
+    return {'code': 200, 'data': {'text': text}}
+
+
+# ==================== 女朋友模式接口 ====================
+# 这四个接口不碰浏览器，所以**不挂 @serialized**：@serialized 会占住全局 browser_lock，
+# 而它们最坏要等 4 次外部 HTTP（geo/current/daily/airquality，每次最长 QWEATHER_TIMEOUT），
+# 真占住锁约 40 秒，会把正好撞上的定时发送挤成 409「浏览器正忙」。
+@app.get('/Api/Girlfriend/Config')
+def GetGirlfriendConfig(authorization: str = Header(None)):
+    """读取女朋友模式配置。Key 不回明文，只回 key_set 让面板显示「已配置」。"""
+    auth_err = require_auth(authorization)
+    if auth_err:
+        return auth_err
+    return {'code': 200, 'data': _girlfriend_view()}
+
+
+# 同上：纯配置读写，不碰浏览器，不挂 @serialized（别为了一个存配置的请求去占 browser_lock）。
+@app.post('/Api/Girlfriend/Config')
+def SetGirlfriendConfig(payload: dict = Body(default=None), authorization: str = Header(None)):
+    """保存女朋友模式配置：body 是部分字段，未知字段忽略，字符串统一 strip。
+
+    Key 特殊处理（它是凭据）：留空表示「不修改已保存的那一份」——面板拿不到明文，
+    留空是常态，不能因此把用户已经存好的 Key 抹掉。
+    """
+    auth_err = require_auth(authorization)
+    if auth_err:
+        return auth_err
+    body = payload or {}
+    if not isinstance(body, dict):
+        return {'code': 400, 'data': '请求体必须是一个 JSON 对象'}
+    # 先校验、后落盘：日期不合法就直接返回，不会留下「改了一半」的配置
+    if 'meet_date' in body and str(body.get('meet_date') or '').strip() \
+            and not _valid_meet_date(body.get('meet_date')):
+        return {'code': 400, 'data': '相识日期格式应为 YYYY-MM-DD'}
+    config = _girlfriend_config()
+    old_city = config['city']
+    for field in GF_CONFIG_FIELDS:
+        if field not in body:
+            continue
+        value = body.get(field)
+        if field == 'enabled':
+            config[field] = _bool_flag(value)
+            continue
+        text_value = '' if value is None else str(value).strip()
+        if field == 'key' and not text_value:
+            continue
+        config[field] = text_value
+    if config['city'] != old_city:
+        # 城市变了就必须作废缓存的坐标/时区，否则会拿旧城市的天气当成新城市的发出去；
+        # city_name / city_adm 是「已解析城市」那行显示用的，一并不作废就会显示旧城市。
+        for field in ('lat', 'lon', 'tz', 'city_name', 'city_adm'):
+            if field not in body:
+                config[field] = ''
+    if not STATE.set('girlfriend', config):
+        return {'code': 500, 'data': '女朋友模式配置保存失败（请检查 data 目录的权限与磁盘空间），'
+                                     '本次修改没有生效'}
+    log_event('info', '女朋友模式', '配置已更新', '城市=%s 相识日期=%s' % (
+        config['city'] or '（空）', config['meet_date'] or '（空）'))
+    return {'code': 200, 'data': _girlfriend_view(config)}
+
+
+# 同上：这一路只在调外部天气接口，不碰浏览器，不挂 @serialized。
+@app.get('/Api/Girlfriend/Weather')
+def GirlfriendWeather(refresh: str = None, authorization: str = Header(None)):
+    """取一次真实天气并渲染（面板上的「测试天气」）。
+
+    refresh=1 时重新解析城市（用户刚改了城市名，缓存里的坐标必须作废）。
+    """
+    auth_err = require_auth(authorization)
+    if auth_err:
+        return auth_err
+    text, data, error = girlfriend_render(refresh=_bool_flag(refresh))
+    if error:
+        return {'code': 400, 'data': error}
+    view = _girlfriend_view()
+    return {'code': 200, 'data': {
+        'city': data.get('city') or '',
+        'lat': data.get('lat') or '',
+        'lon': data.get('lon') or '',
+        'tz': data.get('tz') or '',
+        'current': data.get('current') or {},
+        'daily': data.get('daily') or {},
+        'text': text,
+        # 面板「测试天气」之后要顺手把解析出来的城市回显出来（这一步已经写过配置了）
+        'city_resolved': view.get('city_resolved', False),
+        'city_resolved_text': view.get('city_resolved_text') or '',
+    }}
+
+
+# 同上：预览只是即时调一次天气接口渲染，不碰浏览器，不挂 @serialized。
+@app.get('/Api/Girlfriend/Preview')
+def GirlfriendPreview(period: str = None, authorization: str = Header(None)):
+    """按时段预览问候语（面板上的「取一条试试」），不发送任何消息。
+
+    period 只认 auto / morning / noon / night，其它值一律按 auto（当前时刻）处理，
+    免得面板传个脏值就整个报错。
+    """
+    auth_err = require_auth(authorization)
+    if auth_err:
+        return auth_err
+    moment = datetime.now()
+    wanted = str(period or '').strip().lower()
+    if wanted not in GF_GREETING:
+        wanted = 'auto'
+    resolved = girlfriend_period(moment) if wanted == 'auto' else wanted
+    text, _data, error = girlfriend_render(period=resolved, moment=moment)
+    if error:
+        return {'code': 400, 'data': error}
+    return {'code': 200, 'data': {
+        'period': resolved,
+        'period_text': GF_PERIOD_TEXT[resolved],
+        'text': text,
+    }}
 
 
 # 抖音账号资料接口（参考 prometheus-relay 的 PROFILE_PATHS / _probe_profile）
@@ -4444,12 +5830,14 @@ def GetUserInfo(authorization: str = Header(None)):
     if Login_is_bool:
         nickname = _fetch_profile_nickname()
         if nickname:
+            _account_mark_seen(nickname)
             return {'code': 200, 'data': nickname}
         match = re.search(r'\\"nickname\\":\\"([^\\"]+)\\"', driver.page_source)
         if match:
             text = match.group(0)
             clean = text.replace('\\"', '"')
             data = json.loads('{' + clean + '}')
+            _account_mark_seen(data['nickname'])
             return {'code': 200, 'data': data['nickname']}
         else:
             return {'code': 400, 'data': '已登录,但未获取到用户名'}
@@ -5115,6 +6503,8 @@ def _task_view(task_id, meta, moment=None):
         'text': meta.get('text'),
         # 前端用它显示「灵签」标记并回填编辑表单；老任务没有这个字段，统一给 False
         'sign': bool(meta.get('sign')),
+        # 同上：前端用它回填「内容来源」单选框，老任务没有这个字段就按 'text'
+        'source': str(meta.get('source') or 'text'),
         # 实际执行时刻 = 基准时间 + 当天随机偏移，这里直接给出下一次真实时间
         'next_run': planned.strftime('%Y-%m-%d %H:%M:%S') if planned else '',
         'last_run_date': meta.get('last_run_date'),
@@ -5124,12 +6514,14 @@ def _task_view(task_id, meta, moment=None):
 @app.post('/Time/add')
 @serialized
 def add_time(payload: dict = Body(default=None), time: str = None, name: str = None, text: str = None,
-             authorization: str = Header(None)):
+             source: str = None, authorization: str = Header(None)):
     """给好友新增一条每日定时任务。
 
     从 GET + query 改成 POST + 请求体：好友昵称和消息正文都会进 nginx access log。
     另外补上了 require_browser_session()：原实现直接调用 douyin.Find_Friends，
     浏览器没初始化时是 AttributeError（500），而不是一句能看懂的提示。
+
+    source：'text'（默认）/ 'hitokoto'，后者表示正文在每次发送前现取一句一言。
     """
     auth_err = require_auth(authorization)
     if auth_err:
@@ -5144,11 +6536,17 @@ def add_time(payload: dict = Body(default=None), time: str = None, name: str = N
     time = body.get('time', time)
     name = body.get('name', name)
     text = body.get('text', text)
+    source = body.get('source', source)
     # 昵称先 strip 再判空：只填空格能通过原来的 `if not name`，
     # 结果生成一条「名字为空」的任务，而 _find_task_by_name('') 会让后续同名任务互相误判。
     name = str(name or '').strip()
     if not name:
         return {'code': 400, 'data': '请先选择好友'}
+    # 内容来源非法时直接报错，不能静默按 text 存下：用户以为这条任务在发一言，
+    # 实际发的是自己写死的文案，属于最难查的那种「没生效」。
+    source_error = _task_source_error(source)
+    if source_error:
+        return {'code': 400, 'data': source_error}
     # 时间必须显式校验：format_time 对 None/''/'zzz' 会静默回落到 22:00，
     # 用户以为自己设了别的时间，任务却每天 22:00 发出去。
     time_error = time_format_error(time)
@@ -5166,14 +6564,16 @@ def add_time(payload: dict = Body(default=None), time: str = None, name: str = N
         return blocked
     msg = (text or '').strip()
     sign_flag = _bool_flag(body.get('sign'))
+    source_flag = _normalise_task_source(source)
     task_id = uuid.uuid4().hex[:12]
     # 今天这个时间点已经过去了：直接记为「今天已跑」，免得刚建完任务就立刻补发一条
     planned = planned_run_at(play_time, datetime.now().date(), task_id, JITTER_MINUTES)
     _register_task(play_time, name, msg, task_id=task_id, mark_today=planned <= datetime.now(),
-                   sign=sign_flag)
+                   sign=sign_flag, source=source_flag)
     pool = parse_message_pool(msg)
-    log_event('info', '任务管理', '添加定时任务：%s 每天 %s 左右自动%s' % (
-        name, play_time, '发文昌帝君灵签图文' if sign_flag else '发消息'),
+    log_event('info', '任务管理', '添加定时任务：%s 每天 %s 左右自动%s%s' % (
+        name, play_time, '发文昌帝君灵签图文' if sign_flag else '发消息',
+        _task_source_note(source_flag)),
         '文案池 %d 条：%s' % (len(pool), pool[0]) if pool else (msg or '（灵签：每天取当天签文）'))
     return {
         'code': 200,
@@ -5204,7 +6604,8 @@ def del_time(payload: dict = Body(default=None), task_id: str = None, authorizat
 
 @app.post('/Time/edit')
 def edit_time(payload: dict = Body(default=None), name: str = None, new_time: str = None,
-              text: str = None, sign: str = None, authorization: str = Header(None)):
+              text: str = None, sign: str = None, source: str = None,
+              authorization: str = Header(None)):
     """修改某位好友的定时任务（时间 / 文案）。
 
     旧实现有个必现 bug：新时间与旧时间相同时（前端会预填当前时间，用户直接点「修改」，
@@ -5225,10 +6626,19 @@ def edit_time(payload: dict = Body(default=None), name: str = None, new_time: st
     new_time = body.get('new_time', new_time)
     text = body.get('text', text)
     sign = body.get('sign', sign)
+    source = body.get('source', source)
     # 「没传 sign」和「传了 sign=false」必须区分开：前者保持原样，后者是用户
     # 明确把一条灵签任务改回普通任务。所以这里不能用 _bool_flag(None) 一起吞掉。
     sign_given = ('sign' in body) or (sign is not None)
     sign_flag = _bool_flag(sign)
+    # source 照抄同一套逻辑：没传 = 保持原值（老前端不发这个字段，不能把任务悄悄改回 text），
+    # 传了才覆盖。非法值报错而不是静默按 text 覆盖。
+    source_given = ('source' in body) or (source is not None)
+    if source_given:
+        source_error = _task_source_error(source)
+        if source_error:
+            return {'code': 400, 'data': source_error}
+    new_source = _normalise_task_source(source)
     # 与 /Time/add 同样的理由：非法时间不能被静默替换成 22:00
     if new_time is not None:
         time_error = time_format_error(new_time)
@@ -5239,15 +6649,19 @@ def edit_time(payload: dict = Body(default=None), name: str = None, new_time: st
         return {'code': 404, 'data': '好友 %s 没有定时任务' % name}
     play_time = format_time(new_time)
     old_sign = None
+    old_source = None
     with _task_lock:
         meta = dict(task_meta.get(task_id) or {})
         old_time = meta.get('time')
         old_sign = bool(meta.get('sign'))
+        old_source = _normalise_task_source(meta.get('source'))
         meta['time'] = play_time
         if text is not None:
             meta['text'] = str(text).strip() or ''
         if sign_given:
             meta['sign'] = sign_flag
+        if source_given:
+            meta['source'] = new_source
         if play_time != old_time:
             # 改了时间就允许今天按新时间再发一次；但若今天的新时间点也已经过去，
             # 仍然记为今天已跑，避免用户改完立刻收到一条意料之外的消息
@@ -5259,6 +6673,11 @@ def edit_time(payload: dict = Body(default=None), name: str = None, new_time: st
     if sign_given and sign_flag != old_sign:
         log_event('info', '任务管理', '%s 的定时任务%s灵签图文' % (
             name, '改为发送' if sign_flag else '改回普通文字，不再发送'))
+    if source_given and new_source != old_source:
+        log_event('info', '任务管理', '%s 的定时任务正文改为%s' % (
+            name, {'hitokoto': '一言接口现取一句（写下的文案只当兜底）',
+                   'girlfriend': '按发送时刻现渲染天气问候（写下的文案只当兜底）'}
+            .get(new_source, '任务里自己写的文案')))
     return {
         'code': 200,
         'data': '已将 %s 的定时任务从 %s 修改为 %s' % (name, old_time, play_time),
@@ -5320,8 +6739,12 @@ def test_task_send(payload: dict = Body(default=None), task_id: str = None,
         return {'code': 400, 'data': '没有可以单独发的图：这条任务不是灵签任务，'
                                      '或者签文接口这次没返回签图'}
     # 文案口径与 run_scheduled_send 完全一致（试发必须和真发同样的内容，否则试了也白试）：
-    # 灵签任务留空就用当天签文，写了文案就用用户写的；普通任务留空就现取一条（语录）。
-    if sign_data and not (text or '').strip():
+    # 灵签任务留空就用当天签文，写了文案就用用户写的；女朋友模式现渲染天气问候；
+    # 普通任务留空就现取一条（语录）。
+    if _normalise_task_source(meta.get('source')) == 'girlfriend':
+        # 渲染失败也一样：退回任务里写下的文案 / 现取一条，绝不空着手试发
+        text = render_girlfriend_text() or render_message(text) or random.choice(FALLBACK_MESSAGES)
+    elif sign_data and not (text or '').strip():
         text = render_sign_text(sign_data)
     else:
         text = _resolve_text(text)
@@ -5338,7 +6761,8 @@ def test_task_send(payload: dict = Body(default=None), task_id: str = None,
         kind = '文案'
     log_event('info', '试发', '立即试发任务：给「%s」发%s' % (name, kind), record_text)
     result = _send_now(name, text, image_path=image_path, record_text=record_text,
-                       scope='manual', category='试发', success_text='试发成功')
+                       scope='manual', category='试发', success_text='试发成功',
+                       kind='test')
     if result.get('code') == 200:
         return {'code': 200, 'data': '试发成功（%s）。这次已计入「%s」今天的发送记录，'
                                      '今天的定时任务不会再重复发一条。' % (kind, name)}
@@ -5392,11 +6816,20 @@ def admin_login(username: str = Body(default=None), password: str = Body(default
         token = generate_token()
         log_event('info', '系统', '面板登录成功', {'ip': ip})
         return {'code': 200, 'data': token, 'must_change_password': using_default_password()}
+    # 区分「用户名填错」和「密码不对」。用户名是硬编码的唯一账号，登录页也预填了
+    # admin，它不是秘密；而旧实现两种错都只回一句「登录失败」，用户没法判断到底
+    # 哪个字段填错了 —— 这正是最容易被误当成「密码丢了」的地方。
+    # 密码那一路额外给出找回入口：面板没有、也不该有「忘记密码」自助入口
+    # （那等于给爆破开了后门），重置只能在服务器上跑 reset_password.py。
+    reason = '登录失败。若已忘记密码，在服务器上执行 python reset_password.py 重置'
+    if username != 'admin':
+        reason = '用户名固定为 admin（本程序只有一个面板账号），请检查是否填错'
     if _record_login_failure(ip):
         log_event('error', '系统', '登录连续失败，已临时锁定该来源', {'ip': ip})
         return {'code': 429, 'data': '尝试次数过多，请 %d 秒后再试' % LOGIN_LOCK_SECONDS}
-    log_event('warn', '系统', '面板登录失败', {'ip': ip})
-    return {'code': 400, 'data': '登录失败'}
+    # 只记用户名，绝不记密码
+    log_event('warn', '系统', '面板登录失败', {'ip': ip, '用户名': username})
+    return {'code': 400, 'data': reason}
 
 
 @app.get('/Api/GetLastLoginIP')
@@ -5495,7 +6928,10 @@ def SetNotify(enabled: bool = Body(default=False), url: str = Body(default=None)
     if url is not None:
         url = url.strip()
         if url:
-            invalid = validate_push_url(url)
+            # 必须和 notify()/TestNotify 一样带上 allow_private：报错文案明确让用户去设
+            # SPARK_ALLOW_PRIVATE_PUSH=1，但保存这一步不认这个开关的话，本机 webhook
+            # （ntfy / Uptime Kuma / 内网脚本）永远存不进来，那句话就成了骗人的。
+            invalid = validate_push_url(url, allow_private=ALLOW_PRIVATE_PUSH)
             if invalid:
                 return {'code': 400, 'data': invalid}
             config['url'] = url
@@ -5506,6 +6942,13 @@ def SetNotify(enabled: bool = Body(default=False), url: str = Body(default=None)
         return {'code': 400, 'data': problem}
     config['enabled'] = bool(enabled)
     config['on_success'] = bool(on_success)
+    # 总开关开着、两个通道却都没配：notify() 在第一道门禁就会静默 return False，
+    # 面板上却显示「通知已开启」，真出事时一条都收不到、也没有任何提示。
+    # 这里直接拦住并说清要配什么（邮箱配置在上面 _apply_email_config 里已经合进 config）。
+    if config['enabled'] and not (config.get('url') or _email_configured(config)):
+        return {'code': 400,
+                'data': '开启通知前请先填写推送地址，或把邮箱通知配置完整（SMTP 服务器 + 收件邮箱）'
+                        ' —— 两个通道都没有的话，通知发不出去，界面上也不会有任何提示'}
     if not STATE.set('notify', config):
         return {'code': 500, 'data': '通知配置保存失败（请检查 data 目录权限与磁盘空间），本次修改未生效'}
     log_event('info', '通知', '通知配置已更新',
@@ -5611,11 +7054,24 @@ def SendCheck(payload: dict = Body(default=None), name: str = None, authorizatio
     except Exception as exc:
         log_event('error', '预检', '读取会话列表失败', exc)
         return {'code': 404, 'data': '预检未通过：读取会话列表失败（%s）' % exc_text(exc)}
-    if name not in (douyin.friends_xpath_list or {}):
-        names = list((douyin.friends_xpath_list or {}).keys())
-        return {'code': 404, 'data': '预检未通过：会话列表里没有「%s」（共读到 %d 个，例如：%s）'
-                                     % (name, len(names), '、'.join(names[:8]))}
-    opened, reason = _open_conversation(name, douyin.friends_xpath_list[name])
+    if name in (douyin.friend_ambiguous or set()):
+        return {'code': 404, 'data': '预检未通过：有多位叫「%s」的会话，无法确定发给谁' % name}
+    # 会话列表是虚拟滚动：Updara_FrinderList 只给「当前画面」里那几十行建索引，
+    # 滚过去的两百多个会话只有名字、没有可点的位置。发消息那边遇到这种情况会
+    # 从顶部滚下去把人找回来（locate_friend），预检以前直接拿索引判「有没有」，
+    # 于是「好友列表里明明有、预检却说不存在」—— 这里补上同一步找回。
+    row_xpath = douyin.locate_friend(name)
+    if row_xpath is None:
+        known = douyin.known_names()
+        if name in known:
+            return {'code': 404, 'data': '预检未通过：「%s」在会话列表里（共读到 %d 个），'
+                                         '但滚遍整份列表也没定位到它的那一行。'
+                                         '请在抖音窗口里手动滚到它，再点一次预检。'
+                                         % (name, len(known))}
+        return {'code': 404, 'data': '预检未通过：会话列表里没有「%s」（共读到 %d 个，例如：%s）。'
+                                     '请在好友列表里刷新后重新选择。'
+                                     % (name, len(known), '、'.join(known[:8]))}
+    opened, reason = _open_conversation(name, row_xpath)
     if not opened:
         return {'code': 404, 'data': '预检未通过：%s' % reason}
     editor = _wait_chat_editor(8)
@@ -5656,6 +7112,853 @@ def ClearLogs(authorization: str = Header(None)):
     return {'code': 200, 'data': '日志已清空'}
 
 
+# ==================== 安全中心 ====================
+# 一次只读巡检，把「面板会不会被别人接管」和「抖音号会不会被风控」拆成一条条
+# 可以判定的检查项。为什么不放在前端拼：这些结论要读密码哈希格式、登录节流表、
+# 浏览器会话、Cookie 到期时间和文件 mtime —— 前端一个都拿不到。
+SECURITY_STATUS_PENALTY = {'risk': 30, 'warn': 10, 'info': 0, 'ok': 0}
+
+
+def _human_size(num):
+    try:
+        num = float(num)
+    except (TypeError, ValueError):
+        return '未知'
+    for unit in ('B', 'KB', 'MB'):
+        if num < 1024:
+            return ('%d B' % num) if unit == 'B' else ('%.1f %s' % (num, unit))
+        num /= 1024.0
+    return '%.1f GB' % num
+
+
+def _check(check_id, group, title, status, detail, hint=''):
+    return {
+        'id': check_id,
+        'group': group,
+        'title': title,
+        'status': status,
+        'detail': detail,
+        'hint': hint,
+    }
+
+
+def _pkg_version(name):
+    """读已安装包的版本号；没装或读不到就返回空串（不编版本号）。"""
+    try:
+        from importlib import metadata
+        return metadata.version(name)
+    except Exception:
+        return ''
+
+
+# 只读一次浏览器**自己报出来**的指纹，刻意什么都不改：
+# 只有读到真值，面板上显示的才是「抖音实际看到的你」。
+_FINGERPRINT_JS = """
+return (function () {
+  var out = {
+    ua: navigator.userAgent || '',
+    lang: (navigator.languages || []).join(',') || navigator.language || '',
+    tz: '', hc: navigator.hardwareConcurrency || 0,
+    dpr: window.devicePixelRatio || 0,
+    inner: window.innerWidth + 'x' + window.innerHeight,
+    outer: window.outerWidth + 'x' + window.outerHeight,
+    webgl: ''
+  };
+  try { out.tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ''; } catch (e) {}
+  try {
+    var c = document.createElement('canvas');
+    var gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+    if (gl) {
+      var ext = gl.getExtension('WEBGL_debug_renderer_info');
+      if (ext) {
+        out.webgl = (gl.getParameter(ext.UNMASKED_VENDOR_WEBGL) || '') + ' / ' +
+                    (gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) || '');
+      } else {
+        out.webgl = gl.getParameter(gl.VERSION) || '';
+      }
+    }
+  } catch (e) {}
+  return out;
+})();
+"""
+
+
+def _browser_fingerprint():
+    """读一次真实浏览器当前呈现的指纹（只读，不改）。抢不到锁就返回 None。
+
+    抢 browser_lock 是因为正在发消息时同时操作 driver 会打架；
+    抢不到就返回 None 而不是编一个值 —— 安全中心的价值全在「如实」。
+    """
+    if not init or driver is None:
+        return None
+    if not browser_lock.acquire(timeout=0.5):
+        return None
+    try:
+        data = driver.execute_script(_FINGERPRINT_JS)
+    except Exception as exc:
+        log_event('warn', '浏览器', '读取浏览器指纹失败', exc)
+        return None
+    finally:
+        browser_lock.release()
+    return data if isinstance(data, dict) else None
+
+
+def _read_auth_cookies():
+    """读一次当前浏览器里的抖音登录凭证 Cookie（只读，不改）。
+
+    返回 None 表示「这次没读到」：浏览器没起、没登录、或者抢不到锁。
+    调用方必须区分 None 和「读到了但是零个凭证」—— 后者是真出事了。
+    """
+    if not init or driver is None or not Login_is_bool:
+        return None
+    if not browser_lock.acquire(timeout=0.5):
+        return None
+    try:
+        names, stamps = [], []
+        for item in (driver.get_cookies() or []):
+            if not isinstance(item, dict) or item.get('name') not in AUTH_COOKIE_NAMES:
+                continue
+            names.append(item['name'])
+            expiry = item.get('expiry')
+            if isinstance(expiry, (int, float)) and expiry > 0:
+                stamps.append(float(expiry))
+    except Exception as exc:
+        log_event('warn', '浏览器', '读取登录凭证 Cookie 失败', exc)
+        return None
+    finally:
+        browser_lock.release()
+    earliest = min(stamps) if stamps else None
+    return {
+        'checked': True,
+        'names': sorted(set(names)),
+        'auth_cookies': len(set(names)),
+        'earliest': datetime.fromtimestamp(earliest).strftime('%Y-%m-%d %H:%M:%S') if earliest else '',
+        'earliest_ts': earliest,
+        'ahead_hours': round((earliest - time.time()) / 3600.0, 1) if earliest else None,
+    }
+
+
+def _security_checks(request):
+    """产出全部检查项。拆出来是为了能单独测，不必起 HTTP 请求。"""
+    now = datetime.now()
+    checks = []
+
+    # ---------- 面板：密码 ----------
+    stored = _stored_password_hash()
+    if not stored:
+        checks.append(_check(
+            'panel_password', '面板', '面板密码', 'risk',
+            '仍在使用内置默认密码 123456',
+            '任何知道这个程序的人都能登进面板、导出抖音登录凭证。'
+            '请到「设置」页改密码，或在服务器执行 python reset_password.py。'))
+    elif str(stored).startswith('pbkdf2_sha256$'):
+        checks.append(_check(
+            'panel_password', '面板', '面板密码', 'ok',
+            '已设置自定义密码（PBKDF2-SHA256 加盐，20 万轮）'))
+    else:
+        checks.append(_check(
+            'panel_password', '面板', '面板密码', 'warn',
+            '密码是旧版无盐 SHA-256 哈希，强度偏弱',
+            '下次用面板登录成功后会透明升级为 PBKDF2；'
+            '也可以直接跑 python reset_password.py 重设。'))
+
+    # ---------- 面板：会话 ----------
+    session_count = len(_valid_tokens)
+    checks.append(_check(
+        'panel_sessions', '面板', '登录会话', 'ok',
+        '当前 %d 个有效会话，空闲 %d 小时自动失效；最后登录 IP：%s'
+        % (session_count, TOKEN_TTL_HOURS, _last_login_ip or '无')))
+
+    # ---------- 面板：登录节流 ----------
+    try:
+        _prune_login_throttle()
+    except Exception:
+        pass
+    locked = []
+    for ip in list(_login_locked.keys()):
+        try:
+            remaining = int(_login_throttle_remaining(ip))
+        except Exception:
+            remaining = 0
+        if remaining > 0:
+            locked.append((ip, remaining))
+    failed = {ip: n for ip, n in list(_login_failures.items()) if n}
+    if locked:
+        checks.append(_check(
+            'login_throttle', '面板', '登录节流', 'warn',
+            '%d 个来源因连续登录失败被临时锁定：%s'
+            % (len(locked), '；'.join('%s 还需 %d 秒' % (ip, sec) for ip, sec in locked)),
+            '这是防爆破机制。如果是自己输错密码，等倒计时结束再试。'))
+    elif failed:
+        checks.append(_check(
+            'login_throttle', '面板', '登录节流', 'info',
+            '近期有登录失败记录：%s（连续 %d 次会锁定该 IP %d 秒）'
+            % ('；'.join('%s 失败 %d 次' % (ip, n) for ip, n in failed.items()),
+               LOGIN_FAIL_LIMIT, LOGIN_LOCK_SECONDS),
+            '如果这不是你自己输错，说明有人在猜密码，请确认面板没有直接暴露到公网。'))
+    else:
+        checks.append(_check(
+            'login_throttle', '面板', '登录节流', 'ok',
+            '没有异常登录尝试（连续失败 %d 次锁定该 IP %d 秒）'
+            % (LOGIN_FAIL_LIMIT, LOGIN_LOCK_SECONDS)))
+
+    # ---------- 面板：监听范围 ----------
+    if BIND_HOST in ('127.0.0.1', 'localhost', '::1'):
+        checks.append(_check(
+            'listen_scope', '面板', '监听范围', 'ok',
+            '后端只监听 %s，外部无法直连（对外访问请走 nginx 反代 + HTTPS）' % BIND_HOST))
+    else:
+        checks.append(_check(
+            'listen_scope', '面板', '监听范围', 'warn',
+            '后端监听在 %s，不只是本机' % BIND_HOST,
+            '同网段或公网能直接访问面板端口，密码和 token 会明文过网。'
+            '除非确实需要，否则改回 SPARK_HOST=127.0.0.1 并交给 nginx 反代。'))
+
+    # ---------- 面板：传输加密 ----------
+    try:
+        real_ip = _client_ip(request) or ''
+    except Exception:
+        real_ip = ''
+    local_client = real_ip in ('127.0.0.1', '::1', 'localhost', '')
+    proto = (request.headers.get('x-forwarded-proto') or request.url.scheme or '').lower()
+    if proto == 'https':
+        checks.append(_check(
+            'transport', '面板', '传输加密', 'ok',
+            '当前通过 HTTPS 访问（来源：%s）' % (real_ip or '未知')))
+    elif local_client:
+        checks.append(_check(
+            'transport', '面板', '传输加密', 'info',
+            '当前是明文 HTTP，但请求来自本机（%s），不经过网络' % (real_ip or '本机'),
+            '把面板开放给外网时必须套 HTTPS，否则密码和 token 会在链路上被人看到。'))
+    else:
+        checks.append(_check(
+            'transport', '面板', '传输加密', 'risk',
+            '通过明文 HTTP 从 %s 访问面板' % (real_ip or '外部地址'),
+            '密码和 token 会以明文在网络上传输，请立刻在 nginx 上配 HTTPS。'))
+
+    # ---------- 面板：跨域白名单 ----------
+    if '*' in CORS_ORIGINS:
+        checks.append(_check(
+            'cors', '面板', '跨域白名单', 'warn',
+            'CORS 允许任意来源（*）',
+            '配合凭据使用时等于对全网开放，请把 SPARK_CORS_ORIGINS 收成具体域名。'))
+    else:
+        checks.append(_check(
+            'cors', '面板', '跨域白名单', 'ok',
+            '仅放行 %d 个来源：%s' % (len(CORS_ORIGINS), '、'.join(CORS_ORIGINS) or '无')))
+
+    # ---------- 面板：高权限接口 ----------
+    exposed_safely = local_client or proto == 'https'
+    checks.append(_check(
+        'power_endpoints', '面板', '高权限接口', 'info' if exposed_safely else 'warn',
+        '持有面板密码即可调用：/Api/login/Init/GetCooker（导出抖音全量 Cookie）、'
+        '/Api/LoginDebug（把会话标记成已登录）、/Api/ChangePassword（改密码并踢掉全部会话）',
+        '它们都要 Bearer token，所以风险等于「面板密码泄漏 + 面板可达」（当前：%s）。'
+        % ('仅本机' if local_client else ('HTTPS' if proto == 'https' else '明文外网'))))
+
+    # ---------- 账号：抖音登录态 ----------
+    browser_ready = bool(init and _driver_alive(probe=False))
+    if not init:
+        checks.append(_check(
+            'douyin_session', '账号', '抖音登录态', 'info',
+            '浏览器还没初始化',
+            '到首页点「初始化浏览器」，然后在「设置」页扫码登录抖音。'))
+    elif not browser_ready:
+        checks.append(_check(
+            'douyin_session', '账号', '抖音登录态', 'risk',
+            '浏览器会话已失效（进程可能已经退出）',
+            '重新到首页点一次「初始化浏览器」。在此之前定时任务不会发送。'))
+    elif Login_is_bool:
+        checks.append(_check(
+            'douyin_session', '账号', '抖音登录态', 'ok',
+            '已登录抖音，浏览器会话正常'))
+    else:
+        checks.append(_check(
+            'douyin_session', '账号', '抖音登录态', 'warn',
+            '浏览器正常，但抖音未登录',
+            '到「设置」页扫码登录；未登录时发送会被拦下。'))
+
+    # ---------- 防封号：设备指纹 ----------
+    fp = _browser_fingerprint() if browser_ready else None
+    if not browser_ready:
+        checks.append(_check(
+            'fingerprint', '防封号', '设备指纹', 'info',
+            '浏览器还没启动，暂未读取',
+            '启动浏览器后这里显示的是它**实际报出来**的指纹（UA / 视口 / 缩放 / 时区 / '
+            '语言 / CPU 核数 / WebGL 显卡串）—— 浏览器自己报的值，不是我们编的。'))
+    elif fp is None:
+        checks.append(_check(
+            'fingerprint', '防封号', '设备指纹', 'info',
+            '暂未读取（浏览器正忙于发送，或读取失败）',
+            '点右上角「重新检查」再试一次。'))
+    else:
+        try:
+            dpr = float(fp.get('dpr') or 0)
+        except (TypeError, ValueError):
+            dpr = 0.0
+        detail = ('视口 %s（外窗口 %s，缩放 %.2f）；时区 %s；语言 %s；CPU %s 核；WebGL %s'
+                  % (fp.get('inner') or '?', fp.get('outer') or '?', dpr,
+                     fp.get('tz') or '?', fp.get('lang') or '?', fp.get('hc') or '?',
+                     fp.get('webgl') or '（读不到）'))
+        if (CHROME_USER_AGENT or '').strip():
+            ua_note = ('UA 被 SPARK_USER_AGENT 覆盖了 —— 真实 Chrome 的 UA 本来就是真的，'
+                       '改成假的是反效果，建议清空这个变量')
+        else:
+            ua_note = '用的是真实 Chrome UA'
+        hint = ('%s：%s。\n本机没有启用任何指纹伪造：device_fingerprint.py 是没接线的遗留模块，'
+                'backend.py 里对它的引用为 0。这是有意的 —— 浏览器是真的，指纹就是真的，'
+                '比手工伪造一套自相矛盾的值更安全。' % (ua_note, fp.get('ua') or '?'))
+        if dpr and abs(dpr - 1.0) > 0.01:
+            checks.append(_check(
+                'fingerprint', '防封号', '设备指纹', 'warn',
+                detail + '。缩放 %g 是 --force-device-scale-factor 强制出来的，'
+                '真实 Chrome 几乎不会是这种值，等于自己给自己加了个特征' % dpr,
+                hint))
+        else:
+            checks.append(_check(
+                'fingerprint', '防封号', '设备指纹', 'ok', detail, hint))
+
+    # ---------- 防封号：自动化引擎 ----------
+    selenium_ver = _pkg_version('selenium') or '未知'
+    playwright_ver = _pkg_version('playwright')
+    if playwright_ver:
+        pw_line = ('Playwright %s 已安装，但 playwright_manager.py 没有任何入口引用，'
+                   '当前跑的不是这条路' % playwright_ver)
+    else:
+        pw_line = ('未安装 Playwright；仓库里的 playwright_manager.py 存在但没有任何入口引用，'
+                   '装了也不会被用到')
+    chrome_ver = ('版本 %s' % _browser_version) if _browser_version else '本轮还没启动过，启动后显示'
+    checks.append(_check(
+        'automation_engine', '防封号', '自动化引擎',
+        'ok' if selenium_ver != '未知' else 'warn',
+        'Selenium %s + 真实 Chrome（%s）；%s' % (selenium_ver, chrome_ver, pw_line),
+        '抖音这条链路是「真实 Chrome + webdriver 驱动」在跑。换成 Playwright 等于重写 '
+        'ensure_browser_ready() 和整个 Douyin 类（200+ 行），而且换过去不会自动更安全：'
+        '决定封号率的是网络出口和发送频率，不是驱动库。'))
+
+    # ---------- 防封号：风控识别与自动停发 ----------
+    checks.append(_check(
+        'risk_detect', '防封号', '风控识别与停发', 'ok',
+        '监控 %d 个风控特征词（%s）；命中后暂停发信 %d 分钟，登录失效暂停 %d 分钟'
+        % (len(RISK_MARKERS), '、'.join(RISK_MARKERS),
+           RISK_PAUSE_SECONDS // 60, AUTH_PAUSE_SECONDS // 60),
+        '发送前会先探测页面（RISK_DETECT_JS），看到验证页或「操作频繁」就主动停发，'
+        '而不是硬撞。失败还会按指数退避重试、当天补发一次。'
+        '这是整条链路上最能降低封号率的一环。'))
+
+    # ---------- 防封号：反检测注入 ----------
+    if not init:
+        checks.append(_check(
+            'anti_detection', '防封号', '反检测注入', 'info',
+            '浏览器未初始化，尚未注入',
+            '初始化浏览器时会自动注入，不需要额外操作。'))
+    elif _stealth_injected:
+        checks.append(_check(
+            'anti_detection', '防封号', '反检测注入', 'ok',
+            '已注入：chromedriver 留在 window 上的 cdc_ 痕迹变量已清空，'
+            'navigator.webdriver 为 false',
+            '实测注入前有 7 个 cdc_ 变量、注入后为 0（navigator.webdriver 本来就是 false，'
+            '那是 --disable-blink-features=AutomationControlled 的功劳）。'
+            '这里刻意只抹自动化痕迹、不伪造 UA / 分辨率 / 插件：本机真实 Chrome 的这些值'
+            '本来就是真的，改成假的反而更容易被识别。'))
+    else:
+        checks.append(_check(
+            'anti_detection', '防封号', '反检测注入', 'warn',
+            '未注入：chromedriver 会在 window 上留下 cdc_ 开头的痕迹变量，页面直接就能读到',
+            '先看「信息日志」里有没有「反检测脚本注入失败」，然后重启后端重新初始化浏览器。'))
+
+    # ---------- 账号：发送暂停 ----------
+    try:
+        pause_reason = _send_pause_reason()
+    except Exception:
+        pause_reason = None
+    if pause_reason:
+        checks.append(_check(
+            'send_pause', '防封号', '发送暂停', 'warn', pause_reason,
+            '这是自动保护：撞到风控或登录失效时会主动停发，避免继续触发风控。'))
+    elif using_default_password():
+        checks.append(_check(
+            'send_pause', '防封号', '发送暂停', 'warn',
+            '定时发送处于暂停状态：面板还在用内置默认密码',
+            '到「设置」页改掉密码后会自动恢复发送。'))
+    else:
+        checks.append(_check(
+            'send_pause', '防封号', '发送暂停', 'ok', '没有暂停，发送通道正常'))
+
+    # ---------- 账号：登录凭证有效期 ----------
+    cookie_info = (_read_auth_cookies() if (browser_ready and Login_is_bool) else None) or {
+        'checked': False, 'auth_cookies': 0, 'earliest': '', 'ahead_hours': None}
+
+    if not cookie_info['checked']:
+        checks.append(_check(
+            'cookie_expiry', '账号', '登录凭证有效期', 'info',
+            '暂未读取（浏览器未就绪，或正忙于发送）'))
+    elif not cookie_info['auth_cookies']:
+        checks.append(_check(
+            'cookie_expiry', '账号', '登录凭证有效期', 'risk',
+            '没有找到任何抖音登录凭证 Cookie',
+            '面板显示已登录但凭证不在，发送前会被拦下。请重新扫码登录抖音。'))
+    elif cookie_info['ahead_hours'] is None:
+        checks.append(_check(
+            'cookie_expiry', '账号', '登录凭证有效期', 'ok',
+            '拿到 %d 个登录凭证 Cookie；抖音没有给它们写到期时间（由服务端控制）'
+            % cookie_info['auth_cookies'],
+            '服务端随时可能让登录态失效。真失效时后端会暂停发送并记日志，不会硬撞。'))
+    elif cookie_info['ahead_hours'] < 24:
+        checks.append(_check(
+            'cookie_expiry', '账号', '登录凭证有效期', 'warn',
+            '最早到期的凭证在 %s（约 %s 小时后）'
+            % (cookie_info['earliest'], cookie_info['ahead_hours']),
+            '到期后会掉登录，请提前重新扫码。'))
+    else:
+        checks.append(_check(
+            'cookie_expiry', '账号', '登录凭证有效期', 'ok',
+            '最早到期的凭证在 %s（约 %s 小时后）'
+            % (cookie_info['earliest'], cookie_info['ahead_hours'])))
+
+    # ---------- 账号：发送节奏 ----------
+    checks.append(_check(
+        'pacing', '防封号', '发送节奏', 'info',
+        '每天在计划时间前后随机 %d 分钟内发送；定时任务里同一好友当天只发一条'
+        % (JITTER_MINUTES,),
+        '抖动和按天去重都在，但目前没有「账号级每日发送总量上限」。任务别铺太满，'
+        '固定时间、固定条数、天天一样最容易触发风控。'))
+
+    # ---------- 账号：今日发送量 ----------
+    history = STATE.get('send_history') or {}
+    today = today_str()
+    sent_today = sum(1 for key in history if str(key).startswith(today))
+    checks.append(_check(
+        'daily_volume', '防封号', '今日发送量', 'info',
+        '今天已产生 %d 条发送记录；当前定时任务 %d 个' % (sent_today, len(task_meta)),
+        '自己心里留个上限：新号、久未使用、刚改过密码的号都要更保守。'))
+
+    # ---------- 数据：状态文件 ----------
+    if os.path.exists(STATE_FILE):
+        try:
+            state_size = os.path.getsize(STATE_FILE)
+            state_mtime = datetime.fromtimestamp(
+                os.path.getmtime(STATE_FILE)).strftime('%Y-%m-%d %H:%M:%S')
+        except OSError:
+            state_size, state_mtime = 0, '未知'
+        try:
+            backups = sum(1 for name in os.listdir(os.path.dirname(STATE_FILE) or '.')
+                          if name.startswith('state.json.bak-'))
+        except OSError:
+            backups = 0
+        detail = '状态文件 %s（%s，最后修改 %s）' % (STATE_FILE, _human_size(state_size), state_mtime)
+        if backups:
+            detail += '；另有 %d 份备份' % backups
+        checks.append(_check('state_file', '数据', '状态文件', 'ok', detail))
+    else:
+        checks.append(_check(
+            'state_file', '数据', '状态文件', 'warn',
+            '找不到 %s' % STATE_FILE,
+            '刚部署时属正常（后端首次启动会创建）。但如果之前明明有任务，'
+            '说明数据目录被换过或权限不对。'))
+
+    # ---------- 数据：登录态目录 ----------
+    if os.path.isdir(CHROME_PROFILE_DIR):
+        lock_file = os.path.join(CHROME_PROFILE_DIR, 'SingletonLock')
+        if os.path.exists(lock_file) and not init:
+            checks.append(_check(
+                'profile_dir', '数据', '登录态目录', 'warn',
+                'chrome-profile 里残留 SingletonLock，但后端并没有在跑浏览器',
+                '多半是上次异常退出留下的。如果初始化浏览器报「user-data-dir 已被占用」，'
+                '关掉所有 Chrome 后删掉 %s。' % lock_file))
+        else:
+            checks.append(_check(
+                'profile_dir', '数据', '登录态目录', 'ok',
+                '登录态目录 %s 正常（抖音的登录状态就存在这里，不要删、不要提交进 git）'
+                % CHROME_PROFILE_DIR))
+    else:
+        checks.append(_check(
+            'profile_dir', '数据', '登录态目录', 'info',
+            '登录态目录还不存在（%s）' % CHROME_PROFILE_DIR,
+            '首次初始化浏览器时会自动创建。'))
+
+    # ---------- 数据：运行日志 ----------
+    if os.path.exists(APP_LOG_FILE):
+        try:
+            log_size = _human_size(os.path.getsize(APP_LOG_FILE))
+        except OSError:
+            log_size = '未知'
+        checks.append(_check(
+            'app_log', '数据', '运行日志', 'ok',
+            '%s（%s）' % (APP_LOG_FILE, log_size),
+            '登录、发送、风控暂停等事件都会记在这里，排查问题先看它。'))
+    else:
+        checks.append(_check('app_log', '数据', '运行日志', 'info', '还没有日志文件'))
+
+    # ---------- 运行时 ----------
+    scheduler_alive = bool(_scheduler_thread and _scheduler_thread.is_alive())
+    checks.append(_check(
+        'runtime', '运行时', '运行状态', 'ok' if scheduler_alive else 'risk',
+        '版本 %s，已运行 %d 秒；调度线程%s；定时任务 %d 个；发送队列 %d；待补发 %d'
+        % (VERSION, int((now - start_time).total_seconds()),
+           '正常' if scheduler_alive else '已停止', len(task_meta), _send_queue.qsize(),
+           len(((STATE.get('retry_queue') or {}).get('items')) or [])),
+        '' if scheduler_alive else '调度线程没了就不会再自动发送，请重启后端。'))
+
+    return checks, {
+        'browser_ready': browser_ready,
+        'logged_in': bool(Login_is_bool),
+        'stealth_injected': bool(_stealth_injected),
+        'browser_version': _browser_version or '未启动',
+        'viewport': (fp or {}).get('inner') or '',
+        'dpr': (fp or {}).get('dpr') or '',
+        'timezone': (fp or {}).get('tz') or '',
+        'webgl': (fp or {}).get('webgl') or '',
+        'selenium': selenium_ver,
+        'playwright': playwright_ver or '未安装',
+        'sessions': session_count,
+        'sent_today': sent_today,
+        'tasks': len(task_meta),
+        'bind_host': BIND_HOST,
+        'client_ip': real_ip or '本机',
+        'scheme': proto or 'http',
+    }
+
+
+@app.get('/Api/Security/Overview')
+def SecurityOverview(request: Request, authorization: str = Header(None)):
+    """安全中心汇总巡检（只读）。"""
+    auth_err = require_auth(authorization)
+    if auth_err:
+        return auth_err
+
+    checks, facts = _security_checks(request)
+    penalty = sum(SECURITY_STATUS_PENALTY.get(item['status'], 0) for item in checks)
+    score = max(0, 100 - penalty)
+    if score >= 85:
+        level = 'good'
+    elif score >= 60:
+        level = 'warn'
+    else:
+        level = 'risk'
+    counts = {'ok': 0, 'info': 0, 'warn': 0, 'risk': 0}
+    for item in checks:
+        counts[item['status']] = counts.get(item['status'], 0) + 1
+
+    return {
+        'code': 200,
+        'data': {
+            'generated_at': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'score': score,
+            'level': level,
+            'counts': counts,
+            'checks': checks,
+            'facts': facts,
+        },
+    }
+
+
+@app.post('/Api/Security/RevokeAll')
+def SecurityRevokeAll(authorization: str = Header(None), payload: dict = Body(None)):
+    """把全部面板会话踢下线（包括发起这次请求的这一个）。
+
+    要求重新输一次密码：这是「怀疑面板密码泄漏」时按的按钮，
+    只凭一个可能已经泄漏的 token 就能把主人自己锁在外面不合理。
+    """
+    auth_err = require_auth(authorization)
+    if auth_err:
+        return auth_err
+    body = payload or {}
+    if not check_password(body.get('password')):
+        return {'code': 400, 'data': '密码不正确'}
+    revoked = _valid_tokens.revoke_all()
+    log_event('warn', '系统', '已吊销全部面板会话（安全中心手动操作）', {'revoked': revoked})
+    return {'code': 200, 'data': {'revoked': revoked}}
+
+
+# ==================== 抖音账号 ====================
+# 单用户模式：本程序只登录一个抖音账号，就是 chrome-profile/ 里的那一个。
+# 所以这里是「账号信息」而不是「账号管理」—— 没有增删改账号这回事。
+# 除了用户自己填的备注，其余字段全部从真实运行状态里现读，不落盘、不编造。
+# 历史背景：v3 多用户版有 douyin_accounts 表和一套账号 CRUD，已随多用户版一起删除；
+# 面板上也一度有个 Accounts 页面调用 /Api/Accounts/*，而 backend.py 从没实现过那些路由，
+# 那个页面点开永远是空的 —— 所以它当时被删掉了。这里是为它补上真实实现。
+ACCOUNT_NOTE_MAX = 100
+
+
+def _account_meta():
+    """抖音账号的本地备注信息（备注 / 昵称 / 添加时间）。读不到就是空字典。"""
+    meta = STATE.get('douyin_account')
+    return dict(meta) if isinstance(meta, dict) else {}
+
+
+def _account_meta_update(**fields):
+    meta = _account_meta()
+    meta.update(fields)
+    STATE.set('douyin_account', meta)
+    return meta
+
+
+def _account_mark_seen(nickname=None):
+    """第一次确认真实登录成功时记下时间；有昵称就顺手存下来。
+
+    只写一次（added_at 已有就不再改），避免每轮轮询都写盘。
+    """
+    meta = _account_meta()
+    changed = {}
+    if not meta.get('added_at'):
+        changed['added_at'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    if nickname and nickname != meta.get('nickname'):
+        changed['nickname'] = nickname
+    if changed:
+        _account_meta_update(**changed)
+    return changed
+
+
+@app.get('/Api/Account/Info')
+@serialized
+def AccountInfo(authorization: str = Header(None)):
+    """当前抖音账号的真实状态（单用户模式下一个账号）。
+
+    要挂 @serialized：这里虽然只是「读」，但读的是 WebDriver（cookie 到期时间）
+    和 douyin 好友列表缓存，跨线程读 driver 和跨线程写一样是未定义行为 ——
+    发送进行中被前端刷新一次，就可能读到半个页面甚至让发送流程报未确认。
+    browser_lock 是 RLock，所以里面 _read_auth_cookies() 再拿一次锁不会自锁。
+    """
+    auth_err = require_auth(authorization)
+    if auth_err:
+        return auth_err
+
+    meta = _account_meta()
+    browser_ok = bool(init and _driver_alive(probe=False))
+    logged_in = bool(browser_ok and Login_is_bool)
+
+    # 已经真的登录了但还没记过添加时间 —— 现在补上（只会写这一次）。
+    if logged_in and not meta.get('added_at'):
+        _account_mark_seen()
+        meta = _account_meta()
+
+    cookie = _read_auth_cookies() if logged_in else None
+    if not logged_in:
+        cookie_status, cookie_text = 'unlogged', '未登录'
+    elif cookie is None:
+        cookie_status, cookie_text = 'unknown', '暂未读取（浏览器正忙）'
+    elif not cookie['auth_cookies']:
+        cookie_status, cookie_text = 'missing', '异常：没有凭证 Cookie'
+    elif cookie['ahead_hours'] is None:
+        cookie_status, cookie_text = 'valid', '有效（%d 个凭证，无到期时间）' % cookie['auth_cookies']
+    elif cookie['ahead_hours'] < 0:
+        cookie_status, cookie_text = 'expired', '已过期'
+    elif cookie['ahead_hours'] < 24:
+        cookie_status, cookie_text = 'expiring', '即将到期（%.1f 小时后）' % cookie['ahead_hours']
+    else:
+        cookie_status, cookie_text = 'valid', '有效（%d 个凭证）' % cookie['auth_cookies']
+
+    # 好友数只从内存里读现成的，不为了刷新一个数字去开一次好友列表。
+    friend_count = None
+    cached_friends = _cache_get('friends')
+    if isinstance(cached_friends, dict) and isinstance(cached_friends.get('data'), dict):
+        value = cached_friends['data'].get('count')
+        if isinstance(value, int):
+            friend_count = value
+    if friend_count is None and douyin is not None:
+        names = getattr(douyin, 'friends_xpath_list', None)
+        if names:
+            friend_count = len(names)
+
+    today = datetime.now().strftime('%Y-%m-%d')
+    sent_today = sum(1 for key in (STATE.get('send_history') or {}) if str(key).startswith(today))
+
+    return {'code': 200, 'data': {
+        'id': 'default',
+        'nickname': meta.get('nickname') or '',
+        'note': meta.get('note') or '',
+        'note_max': ACCOUNT_NOTE_MAX,
+        'added_at': meta.get('added_at') or '',
+        'cookie_status': cookie_status,
+        'cookie_text': cookie_text,
+        'cookie_count': cookie['auth_cookies'] if cookie else 0,
+        'cookie_names': cookie['names'] if cookie else [],
+        'cookie_expire': cookie['earliest'] if cookie else '',
+        'cookie_ahead_hours': cookie['ahead_hours'] if cookie else None,
+        'friend_count': friend_count,
+        'friend_count_known': friend_count is not None,
+        'sent_today': sent_today,
+        'logged_in': logged_in,
+        'browser_ready': browser_ok,
+        'stealth_injected': bool(_stealth_injected),
+        'engine': 'Selenium %s + Chrome %s'
+                  % (_pkg_version('selenium') or '未知', _browser_version or '未启动'),
+        'profile_dir': CHROME_PROFILE_DIR,
+    }}
+
+
+@app.post('/Api/Account/Note')
+def AccountSetNote(authorization: str = Header(None), payload: dict = Body(None)):
+    """保存账号备注：纯本地标记，不影响登录和发送。"""
+    auth_err = require_auth(authorization)
+    if auth_err:
+        return auth_err
+    body = payload if isinstance(payload, dict) else {}
+    note = str(body.get('note') or '').strip()
+    if len(note) > ACCOUNT_NOTE_MAX:
+        return {'code': 400, 'data': '备注最多 %d 个字' % ACCOUNT_NOTE_MAX}
+    _account_meta_update(note=note)
+    log_event('info', '账号', '更新抖音账号备注', note)
+    return {'code': 200, 'data': {'note': note}}
+
+
+# ==================== 消息记录 ====================
+# 面板上「消息记录」页读的就是这里。
+#
+# 数据源只有一个：state.json 里的 send_history —— 也就是发送记账本身。
+# 不另建一份记录，是因为记账是**已经存在且必须存在**的（防重复发送靠它），
+# 再抄一份只会多出一个可能对不上的真相；而且进程被 kill 掉时，唯一写得进去的
+# 就是这份。
+#
+# 键的格式要注意历史包袱：老版本把文案哈希也拼进键里（'日期|好友|哈希'），
+# 现在只保留 '日期|好友'。所以这里两种都解析，否则用户在旧数据上会看到空名字。
+HISTORY_STATUS_TEXT = {
+    'success': '成功',
+    'failed': '失败',
+    'unknown': '结果未确认',
+}
+
+
+def _history_rows():
+    """把 send_history 摊平成按时间倒序的列表。"""
+    history = STATE.get('send_history') or {}
+    rows = []
+    for key, value in history.items():
+        parts = str(key).split('|')
+        record = value if isinstance(value, dict) else {}
+        status = str(record.get('status') or 'unknown')
+        kind = str(record.get('kind') or '')
+        rows.append({
+            'key': str(key),
+            'day': parts[0] if parts else '',
+            'name': parts[1] if len(parts) > 1 else '',
+            'status': status,
+            'status_text': HISTORY_STATUS_TEXT.get(status, status),
+            'kind': kind,
+            'kind_text': KIND_LABELS.get(kind, '') if kind else '',
+            'at': str(record.get('at') or ''),
+            'text': str(record.get('text') or ''),
+            'detail': str(record.get('detail') or ''),
+        })
+    # 时间倒序。没有 at 的（手改过 / 异常数据）退回按日期排，保证顺序稳定可翻页。
+    rows.sort(key=lambda item: (item['at'] or item['day'] or '', item['key']), reverse=True)
+    return rows
+
+
+@app.get('/Api/History/List')
+def HistoryList(page: int = 1, size: int = 20, status: str = None, keyword: str = None,
+                days: int = 0, authorization: str = Header(None)):
+    """发送记录列表（分页 + 筛选）。"""
+    auth_err = require_auth(authorization)
+    if auth_err:
+        return auth_err
+
+    all_rows = _history_rows()
+
+    # 统计始终基于**全部**记录，不随筛选变化 —— 否则用户一筛「失败」，
+    # 头上的「成功 N 条」就跟着变成 0，看不出整体情况。
+    stats = {'success': 0, 'failed': 0, 'unknown': 0}
+    for row in all_rows:
+        if row['status'] in stats:
+            stats[row['status']] += 1
+
+    rows = all_rows
+    if status in HISTORY_STATUS_TEXT:
+        rows = [row for row in rows if row['status'] == status]
+
+    if days and days > 0:
+        cutoff = (datetime.now() - timedelta(days=int(days) - 1)).strftime('%Y-%m-%d')
+        rows = [row for row in rows if row['day'] >= cutoff]
+
+    keyword = (keyword or '').strip()
+    if keyword:
+        lowered = keyword.lower()
+        rows = [row for row in rows
+                if lowered in row['name'].lower()
+                or lowered in row['text'].lower()
+                or lowered in row['detail'].lower()]
+
+    try:
+        page = int(page)
+    except (TypeError, ValueError):
+        page = 1
+    try:
+        size = int(size)
+    except (TypeError, ValueError):
+        size = 20
+    page = max(1, page)
+    size = min(200, max(1, size))
+
+    total = len(rows)
+    pages = max(1, (total + size - 1) // size)
+    page = min(page, pages)
+    start = (page - 1) * size
+
+    retry_state = STATE.get('retry_queue') or {}
+    retry_items = retry_state.get('items') or []
+    manual = STATE.get('manual_retries') or {}
+
+    return {'code': 200, 'data': {
+        'list': rows[start:start + size],
+        'total': total,
+        'page': page,
+        'size': size,
+        'pages': pages,
+        'stats': stats,
+        'keep_days': HISTORY_KEEP_DAYS,
+        'record_count': len(all_rows),
+        'oldest': all_rows[-1]['day'] if all_rows else '',
+        'newest': all_rows[0]['day'] if all_rows else '',
+        # 补发队列和人工重发标记也一并给出来：它们解释了「为什么会有记录」，
+        # 但本身不是记录，所以不混进 list 里。
+        'retry': {
+            'date': str(retry_state.get('date') or ''),
+            'due_at': str(retry_state.get('due_at') or ''),
+            'done': bool(retry_state.get('done')),
+            'names': [str(item.get('name') or '')
+                      for item in retry_items if isinstance(item, dict)],
+        },
+        'manual_retries': sorted(str(key) for key in manual.keys()),
+    }}
+
+
+@app.post('/Api/History/Clear')
+def HistoryClear(payload: dict = Body(default=None), authorization: str = Header(None)):
+    """清空消息记录（台账）。
+
+    这份记账同时是「今天已经给这个人发过」的判定依据，所以默认只清今天以前的
+    记录（scope='old'）；要连今天一起清必须显式 scope='all'。清空只影响台账，
+    不改动任何发送状态。
+    """
+    auth_err = require_auth(authorization)
+    if auth_err:
+        return auth_err
+
+    body = payload if isinstance(payload, dict) else {}
+    scope = str(body.get('scope') or 'old')
+    if scope not in ('old', 'all'):
+        return {'code': 400, 'data': '清空范围不支持，只支持 old 或 all'}
+
+    today = today_str()
+    with _history_lock:
+        history = STATE.get('send_history') or {}
+        if not isinstance(history, dict):
+            history = {}
+        if scope == 'all':
+            kept = {}
+        else:
+            # 键是「日期|好友」（旧版还有「日期|好友|哈希」），日期取第一段。
+            kept = {key: value for key, value in history.items()
+                    if str(key).split('|', 1)[0] == today}
+        removed = len(history) - len(kept)
+        STATE.set('send_history', kept)
+
+    log_event('info', '消息记录',
+              '清空了 %d 条消息记录（scope=%s）' % (removed, scope))
+    return {'code': 200, 'data': {'removed': removed, 'kept': len(kept), 'scope': scope}}
+
+
 # ==================== 健康检查 ====================
 @app.get('/healthz')
 def Healthz():
@@ -5691,7 +7994,7 @@ if __name__ == "__main__":
     port = int(os.getenv('PORT', '9844'))
     uvicorn.run(
         app,
-        host="127.0.0.1",
+        host=BIND_HOST,
         port=port,
         reload=False
     )

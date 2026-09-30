@@ -9,6 +9,42 @@
 
 ---
 
+## 一键安装脚本（先看这个）
+
+仓库里带了 `deploy/baota-install.sh`，把下面第 0~8 节里**能自动化的部分**串成一条命令：
+
+```bash
+sudo bash deploy/baota-install.sh --dry-run   # 先看它打算干什么，什么都不改
+sudo bash deploy/baota-install.sh             # 真的装
+```
+
+它会依次做：系统依赖（xvfb / 中文字体 / python3-venv）→ 时区 `Asia/Shanghai`
+→ Google Chrome 官方 deb → `data/ logs/ chrome-profile/` 与属主
+→ `.venv` + 依赖 → `dist/`（有 npm 就构建，否则提示你本地构建后上传）
+→ 生成 `deploy/baota-env.sh`（`TZ` / `PORT` / `SPARK_PYTHON` / 四个发送节奏参数）
+→ 写 Supervisor 守护配置（自动探测宝塔的配置目录）
+→ 给了 `--site-conf` 才改 nginx 反代（自动备份 + `nginx -t` + reload）。
+
+它**不代替**你在面板里点的那几下，跑完会把「还剩什么要手点」列出来。
+脚本幂等：每一步都先判断再做，`.venv`、`dist/index.html`、已经打过的 nginx 标记都会跳过。
+
+| 参数 | 用途 |
+| --- | --- |
+| `--python <绝对路径>` | 用宝塔「Python 项目管理器」装的那个解释器 |
+| `--run-user www` | 以后由 `www` 常驻（脚本会跟着 `chown -R`） |
+| `--site-conf <路径>` | 宝塔站点配置文件；给了才写反代 |
+| `--skip-chrome` / `--skip-dist` / `--skip-supervisor` / `--skip-nginx` | 跳过对应步骤 |
+| `--dry-run` | 只打印计划，不改任何东西 |
+| `--help` | 全部参数 |
+
+> 脚本只针对 **Debian 12 / Ubuntu 22.04+** 写过；其它发行版会先警告，
+> 要硬上得加 `--force`（CentOS 7 的 yum 源已 EOL，不建议）。
+
+下面第 0~10 节是**手动版的完整步骤**，脚本做的每一步都能在里面找到对应解释 ——
+出问题时按它逐条对照即可。
+
+---
+
 ## 0. 环境要求
 
 | 项 | 建议 |
@@ -17,7 +53,7 @@
 | 内存 | 2G 起。Chromium 常驻约 500MB~1G；1G 内存请先在宝塔里加 2G swap |
 | 时区 | **必须 `Asia/Shanghai`**，否则「每天 22:00」会变成北京时间早上 6 点 |
 | Python | 3.10+（推荐 3.11），可来自系统，也可用宝塔的 Python 项目管理器 |
-| 浏览器 | `chromium` + `chromium-driver`（两者大版本必须一致） |
+| 浏览器 | **Google Chrome 官方 .deb**（推荐，Ubuntu / Debian 通用）；Debian 12 也可用 `chromium` + `chromium-driver` |
 
 时区确认与修正：
 
@@ -28,17 +64,40 @@ timedatectl set-timezone Asia/Shanghai
 
 ---
 
-## 1. 装系统依赖（Chromium + 驱动 + 虚拟显示 + 中文字体）
+## 1. 装系统依赖（浏览器 + 驱动 + 虚拟显示 + 中文字体）
+
+**推荐做法：装 Google Chrome 官方 .deb**（Ubuntu / Debian 通用，也是本项目在
+Windows 上实测过的同一个浏览器）：
 
 ```bash
 apt update
-apt install -y chromium chromium-driver xvfb fonts-noto-cjk
+apt install -y xvfb fonts-noto-cjk wget
+wget -q https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb -O /tmp/chrome.deb
+apt install -y /tmp/chrome.deb
 ```
 
-四样东西各有用途，缺一个都会以很难懂的方式失败：
+装完的路径是 `/opt/google/chrome/chrome`（`/usr/bin/google-chrome` 是它的软链）。
+**这正好是后端在 Linux 上的内置默认值**，所以这一步装完不需要设 `CHROME_BINARY`。
 
-- `chromium` / `chromium-driver`：浏览器和驱动。**Selenium 与浏览器版本强耦合**，
-  升级时必须两个一起升（`apt install chromium chromium-driver` 一起执行即可）。
+**Debian 12 的替代做法**：Debian 仓库里的 `chromium` / `chromium-driver` 是**真 deb**，
+也可以直接 `apt install -y chromium chromium-driver`（装到 `/usr/bin/chromium`、
+`/usr/bin/chromedriver`），此时要显式设 `CHROME_BINARY=/usr/bin/chromium`。
+
+驱动（chromedriver）通常不用自己操心：Selenium 4 内置的 Selenium Manager 会在第一次
+启动时自动下载与浏览器匹配的驱动。**前提是服务器能访问外网**；不能的话就手动放一份：
+
+```bash
+# 手动方案：下载与浏览器大版本一致的 chromedriver，放进 PATH
+google-chrome --version        # 看大版本号，例如 152.0.7977.84
+# 到 https://googlechromelabs.github.io/chrome-for-testing/ 下对应版本
+install -m 755 chromedriver /usr/local/bin/chromedriver
+```
+
+`CHROMEDRIVER_PATH` 留空时，后端先找 `PATH` 里的 `chromedriver`，找不到才交给
+Selenium Manager。
+
+`xvfb` 与 `fonts-noto-cjk` 各有用途，缺一个都会以很难懂的方式失败：
+
 - `xvfb`：服务器没有桌面，靠它提供一块虚拟屏幕。本项目用的是「可见」Chrome，
   没有显示环境时后端会直接回 `初始化失败: 未找到可用的 DISPLAY/Xvfb 环境`。
 - `fonts-noto-cjk`：缺了它页面上的中文全是方框，好友昵称和验证提示根本没法看。
@@ -46,17 +105,16 @@ apt install -y chromium chromium-driver xvfb fonts-noto-cjk
 装完立刻验证（这一步别省）：
 
 ```bash
-/usr/bin/chromium --version
-/usr/bin/chromedriver --version     # 大版本号要和上面一致
+/opt/google/chrome/chrome --version   # 走 Debian chromium 的则是 /usr/bin/chromium --version
 xvfb-run --help >/dev/null && echo xvfb-ok
 ```
 
-**Ubuntu 的坑**：`apt install chromium-browser` 装的是 snap 包装器，
-在服务器上经常起不来（报 `Failed to connect to bus` 之类）。
-请用 `chromium` 这个包名（Debian/Ubuntu 22.04+ 的 universe 源里有真包），
-或者去 Google 下 `.deb` 装 `google-chrome-stable`，
-并把 `CHROME_BINARY` 指到 `/opt/google/chrome/chrome`、
-`CHROMEDRIVER_PATH` 指到与之版本匹配的驱动。
+> **Ubuntu 的坑（装错了一定起不来）**：从 Ubuntu 22.04 起，`chromium`、
+> `chromium-browser`、`chromium-driver` 在 universe 源里**全都是 snap 过渡包**
+> —— 真 deb 只在 Debian 里。装完二进制会落到 `/snap/bin/chromium.chromedriver`，
+> `/usr/bin/chromedriver` 根本不存在；snapd 在服务器上还经常直接报
+> `Failed to connect to bus`。**所以 Ubuntu 上请走上面的 Google Chrome .deb，
+> 不要 `apt install chromium`。**
 
 ---
 
@@ -71,7 +129,7 @@ mkdir -p data logs chrome-profile
 ```
 
 - `data/`：`state.json`（登录态、定时任务、发送记账）
-- `logs/`：`app.log`、`backend.log`、`shots/`（失败截图）
+- `logs/`：`app.log`（面板「信息日志」读的就是它）、`shots/`（发送失败时的截图）
 - `chrome-profile/`：Chrome 用户目录，**扫码一次就能长期复用登录态**
 
 这三个目录是全部身家，删了就要重新扫码。`.gitignore` 已经把它们排除在仓库外。
@@ -139,6 +197,13 @@ npm run build
 我们特意给启动脚本留了 `SPARK_PYTHON` 口子，所以**面板里的 Python 可以直接用，
 不需要改脚本、也不用去动系统 PATH**：
 
+> ⚠️ **先定好以后用哪个用户常驻，再用那个用户跑第一次。** 这一步创建的 `.venv/`、
+> `data/`、`chrome-profile/` 都属于**执行这条命令的那个用户**。先用 `root` 跑通、
+> 之后又把守护进程改成 `www`，守护进程就会写不了 `data/state.json`（表现为能登录、
+> 但任务和登录态都存不下来）。要么全程 `root`，要么先
+> `chown -R www:www /www/wwwroot/spark-web` 再以 `www` 跑
+> （非 root 用户下用 `sudo -u www -H bash start-backend.sh`）。
+
 ```bash
 cd /www/wwwroot/spark-web
 
@@ -156,7 +221,7 @@ SPARK_PYTHON=/www/server/pyporject_evn/3.11/bin/python3 bash start-backend.sh
 [spark-web] 使用 Python 3.11.x（/www/.../bin/python3）
 [spark-web] 当前没有 $DISPLAY，改用 xvfb-run -a 在虚拟显示里启动（适合服务器 / systemd）。
 ...
-服务已启动（版本 1.1.0，退出请使用 Ctrl-C，会自动关闭浏览器）
+服务已启动（版本 1.2.0，退出请使用 Ctrl-C，会自动关闭浏览器）
 Uvicorn running on http://127.0.0.1:9844
 ```
 
@@ -183,17 +248,20 @@ Uvicorn running on http://127.0.0.1:9844
 
 ```bash
 SPARK_PYTHON=/www/server/pyporject_evn/3.11/bin/python3 \
-CHROME_BINARY=/usr/bin/chromium \
-CHROMEDRIVER_PATH=/usr/bin/chromedriver \
 bash /www/wwwroot/spark-web/start-backend.sh
 ```
+
+上一节装的是 Google Chrome 官方 deb（`/opt/google/chrome/chrome`），那正是后端
+在 Linux 上的默认值，所以这里**不用设 `CHROME_BINARY`**。只有走 Debian 的
+`chromium` 包时才需要再加两行：
+`CHROME_BINARY=/usr/bin/chromium` 与 `CHROMEDRIVER_PATH=/usr/bin/chromedriver`。
 
 勾选「开机自启」。`start-backend.sh` 在检测不到 `$DISPLAY` 时会自己套一层 `xvfb-run -a`，
 所以这里不用手写 Xvfb。
 
-显式指定 `CHROME_BINARY` / `CHROMEDRIVER_PATH` 是有意的：
-容器和部分发行版里 Selenium 会尝试联网下载匹配的驱动（`selenium-manager`），
-服务器没有外网出口时就会卡在这里失败。
+显式把 `CHROME_BINARY` / `CHROMEDRIVER_PATH` 写死（当你不用 Google Chrome 的
+默认路径时）是有意的：否则 Selenium 会尝试联网下载匹配的驱动
+（`selenium-manager`），服务器没有外网出口时就会卡在这里失败。
 
 ### 方式 B：Python 项目管理器
 
@@ -337,7 +405,7 @@ curl -fsS https://spark.example.com/healthz
 | 现象 | 原因与处理 |
 | --- | --- |
 | `初始化失败: 未找到可用的 DISPLAY/Xvfb 环境` | 没装 xvfb，或没通过 `start-backend.sh` / `xvfb-run` 启动 |
-| `SessionNotCreatedException` | `chromium` 与 `chromium-driver` 版本不一致；两个一起 `apt install` 重装 |
+| `SessionNotCreatedException` | 浏览器与 chromedriver 大版本不一致；Debian 上把 `chromium` 与 `chromium-driver` 一起重装，或删掉 `/usr/local/bin/chromedriver` 让 Selenium Manager 重新下匹配版本 |
 | 页面能打开，但所有接口 404 | `/api` 前缀没剥掉：`proxy_pass http://127.0.0.1:9844/;` 结尾的 `/` 漏了 |
 | 登录后过一会儿全部 401 | 会话空闲超过 `SPARK_TOKEN_TTL_HOURS`，或刚改过密码（会清空全部会话）。重新登录即可 |
 | 定时任务到点没发消息 | 看「信息日志」：若提示「浏览器还没初始化」，去首页点初始化；重启服务也会自动初始化 |

@@ -47,7 +47,7 @@
       <!-- 底部链接 -->
       <div class="sidebar-footer">
         <a
-          href="https://github.com/DkoBot/TikTokAutoSparkWeb"
+          href="https://github.com/mcwlgzs/autospark"
           target="_blank"
           class="github-link"
           :title="isCollapsed && !isMobile ? 'GitHub 项目' : ''"
@@ -137,7 +137,10 @@ import {
   Clock,
   ChromeFilled,
   Setting,
-  Document
+  Document,
+  Lock,
+  ChatDotRound,
+  Postcard
 } from '@element-plus/icons-vue'
 
 const router = useRouter()
@@ -204,12 +207,16 @@ watch(isCollapsed, (val) => {
   }
 })
 
+// 顺序 = 侧边栏顺序。设置放最后：日常用的是前几项，配置类的东西挪到最下面不挡路。
 const menuList = [
   { path: '/home', title: '首页', icon: House },
+  { path: '/accounts', title: '抖音账号', icon: Postcard },
   { path: '/friends', title: '好友列表', icon: User },
   { path: '/tasks', title: '定时任务', icon: Clock },
-  { path: '/settings', title: '设置', icon: Setting },
-  { path: '/logs', title: '信息日志', icon: Document }
+  { path: '/logs', title: '信息日志', icon: Document },
+  { path: '/history', title: '消息记录', icon: ChatDotRound },
+  { path: '/security', title: '安全中心', icon: Lock },
+  { path: '/settings', title: '设置', icon: Setting }
 ]
 
 const activeMenu = computed(() => route.path)

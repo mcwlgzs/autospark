@@ -63,7 +63,11 @@ const loginFormRef = ref(null)
 const loading = ref(false)
 
 const loginForm = reactive({
-  username: '',
+  // 后端只认 admin 这一个账号（backend.py 的 admin_login 里是硬编码判断，
+  // 用户名写错了同样只回一句「登录失败」，看不出区别）。
+  // 留空会让人以为要填一个自己注册过的用户名，白白卡在这里。预填好，
+  // 仍然可以改。
+  username: 'admin',
   password: ''
 })
 

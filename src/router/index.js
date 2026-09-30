@@ -25,7 +25,7 @@ const routes = [
         path: 'accounts',
         name: 'Accounts',
         component: () => import('../views/Accounts.vue'),
-        meta: { title: '账号管理', icon: 'Avatar' }
+        meta: { title: '抖音账号', icon: 'Postcard' }
       },
       {
         path: 'friends',
@@ -50,6 +50,18 @@ const routes = [
         name: 'Logs',
         component: () => import('../views/Logs.vue'),
         meta: { title: '信息日志', icon: 'Document' }
+      },
+      {
+        path: 'security',
+        name: 'Security',
+        component: () => import('../views/Security.vue'),
+        meta: { title: '安全中心', icon: 'Lock' }
+      },
+      {
+        path: 'history',
+        name: 'History',
+        component: () => import('../views/History.vue'),
+        meta: { title: '消息记录', icon: 'ChatDotRound' }
       }
     ]
   }

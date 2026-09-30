@@ -1,8 +1,11 @@
 """Selenium 反检测和优化模块
 
 使用 undetected-chromedriver 和多种反检测技术提升成功率
+v2.2: 新增 HumanBehaviorSimulator - 增强行为模拟
 """
 
+import asyncio
+import logging
 import os
 import random
 import time
@@ -20,7 +23,7 @@ try:
     USE_UC = True
 except ImportError:
     USE_UC = False
-    print("⚠️  undetected-chromedriver 未安装，使用标准 Selenium")
+    logging.getLogger(__name__).warning("undetected-chromedriver 未安装，使用标准 Selenium")
 
 
 class StealthDriver:
@@ -324,6 +327,206 @@ class ElementInteractor:
                 if i == retry - 1:
                     raise e
                 time.sleep(delay)
+
+
+class HumanBehaviorSimulator:
+    """高级人类行为模拟器（v2.2新增）"""
+
+    @staticmethod
+    def bezier_curve_mouse_movement(driver, element):
+        """
+        使用贝塞尔曲线模拟真实鼠标轨迹
+
+        Args:
+            driver: WebDriver实例
+            element: 目标元素
+        """
+        try:
+            from selenium.webdriver.common.action_chains import ActionChains
+
+            actions = ActionChains(driver)
+
+            # 获取元素位置
+            location = element.location
+            size = element.size
+
+            # 目标位置（元素中心）
+            end_x = location['x'] + size['width'] // 2
+            end_y = location['y'] + size['height'] // 2
+
+            # 起点（当前鼠标位置，假设为0,0）
+            start_x, start_y = 0, 0
+
+            # 随机控制点（生成曲线）
+            ctrl_x = random.randint(
+                min(start_x, end_x),
+                max(start_x, end_x)
+            )
+            ctrl_y = random.randint(
+                min(start_y, end_y),
+                max(start_y, end_y)
+            )
+
+            # 沿贝塞尔曲线移动（分20步）
+            steps = 20
+            for i in range(steps + 1):
+                t = i / steps
+
+                # 二次贝塞尔曲线公式
+                # B(t) = (1-t)²P0 + 2(1-t)tP1 + t²P2
+                x = (1-t)**2 * start_x + 2*(1-t)*t * ctrl_x + t**2 * end_x
+                y = (1-t)**2 * start_y + 2*(1-t)*t * ctrl_y + t**2 * end_y
+
+                # 移动鼠标
+                if i > 0:  # 跳过第一个点（起点）
+                    prev_t = (i-1) / steps
+                    prev_x = (1-prev_t)**2 * start_x + 2*(1-prev_t)*prev_t * ctrl_x + prev_t**2 * end_x
+                    prev_y = (1-prev_t)**2 * start_y + 2*(1-prev_t)*prev_t * ctrl_y + prev_t**2 * end_y
+
+                    dx = int(x - prev_x)
+                    dy = int(y - prev_y)
+
+                    actions.move_by_offset(dx, dy)
+
+                # 随机微小停顿
+                time.sleep(random.uniform(0.001, 0.005))
+
+            actions.perform()
+
+        except Exception as e:
+            # 如果曲线移动失败，回退到直接点击
+            element.click()
+
+    @staticmethod
+    def simulate_reading_time(content_length: int) -> float:
+        """
+        根据内容长度模拟阅读时间
+
+        Args:
+            content_length: 内容字符数
+
+        Returns:
+            阅读时长（秒）
+        """
+        # 平均阅读速度：中文300字/分钟，英文250词/分钟
+        # 这里按300字/分钟计算
+        words_per_second = 300 / 60
+        base_time = content_length / words_per_second
+
+        # 添加20%的随机波动
+        return base_time * random.uniform(0.8, 1.2)
+
+    @staticmethod
+    async def random_scroll_behavior(driver):
+        """
+        模拟随机滚动行为
+
+        Args:
+            driver: WebDriver实例
+        """
+        scroll_types = ['smooth_scroll', 'jump_scroll', 'read_scroll']
+        behavior = random.choice(scroll_types)
+
+        if behavior == 'smooth_scroll':
+            # 平滑滚动（小步多次）
+            for _ in range(random.randint(2, 5)):
+                driver.execute_script("window.scrollBy(0, 100);")
+                await asyncio.sleep(random.uniform(0.1, 0.3))
+
+        elif behavior == 'jump_scroll':
+            # 跳跃滚动（直接跳到某位置）
+            position = random.uniform(0.3, 0.7)
+            driver.execute_script(f"window.scrollTo(0, document.body.scrollHeight * {position});")
+            await asyncio.sleep(random.uniform(0.5, 1.0))
+
+        else:  # read_scroll
+            # 阅读式滚动（模拟边看边滚）
+            for _ in range(random.randint(3, 7)):
+                driver.execute_script("window.scrollBy(0, 200);")
+                await asyncio.sleep(random.uniform(0.3, 0.8))
+
+    @staticmethod
+    def random_page_interactions(driver, count: int = 3):
+        """
+        在页面上执行随机交互（提高真实性）
+
+        Args:
+            driver: WebDriver实例
+            count: 交互次数
+        """
+        interactions = [
+            # 随机移动鼠标
+            lambda: driver.execute_script("""
+                var event = new MouseEvent('mousemove', {
+                    'view': window,
+                    'bubbles': true,
+                    'cancelable': true,
+                    'clientX': Math.random() * window.innerWidth,
+                    'clientY': Math.random() * window.innerHeight
+                });
+                document.dispatchEvent(event);
+            """),
+
+            # 模拟鼠标悬停
+            lambda: driver.execute_script("""
+                var elements = document.querySelectorAll('a, button, div');
+                if (elements.length > 0) {
+                    var randomEl = elements[Math.floor(Math.random() * elements.length)];
+                    randomEl.dispatchEvent(new Event('mouseenter', {bubbles: true}));
+                }
+            """),
+
+            # 随机聚焦元素
+            lambda: driver.execute_script("""
+                var focusable = document.querySelectorAll('a, button, input, textarea');
+                if (focusable.length > 0) {
+                    var randomEl = focusable[Math.floor(Math.random() * focusable.length)];
+                    randomEl.focus();
+                    setTimeout(() => randomEl.blur(), 100);
+                }
+            """)
+        ]
+
+        for _ in range(min(count, len(interactions))):
+            try:
+                random.choice(interactions)()
+                time.sleep(random.uniform(0.2, 0.5))
+            except:
+                pass
+
+    @staticmethod
+    def simulate_human_delay(min_seconds: float = 0.5, max_seconds: float = 2.0):
+        """
+        模拟人类操作延迟
+
+        Args:
+            min_seconds: 最小延迟
+            max_seconds: 最大延迟
+        """
+        delay = random.uniform(min_seconds, max_seconds)
+        time.sleep(delay)
+
+    @staticmethod
+    def add_random_typos(text: str, typo_rate: float = 0.05) -> str:
+        """
+        在文本中添加随机打字错误（然后修正）
+
+        Args:
+            text: 原始文本
+            typo_rate: 错误率（0-1）
+
+        Returns:
+            包含错误和修正的文本序列
+        """
+        if random.random() > typo_rate or len(text) < 3:
+            return text
+
+        # 随机选择一个位置插入错误字符
+        pos = random.randint(1, len(text) - 1)
+        wrong_char = random.choice('qwertyuiopasdfghjklzxcvbnm')
+
+        # 返回：正确部分 + 错误字符 + 退格 + 继续
+        return text[:pos] + wrong_char + '\b' + text[pos:]
 
 
 def create_stealth_driver(

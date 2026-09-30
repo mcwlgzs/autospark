@@ -13,8 +13,8 @@ from sqlalchemy import (
     create_engine, Column, Integer, String, Text, DateTime,
     Boolean, Float, ForeignKey, Date, Index, UniqueConstraint
 )
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship, Session
+from sqlalchemy.orm import declarative_base
+from sqlalchemy.orm import relationship, Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 import os
 
@@ -306,15 +306,20 @@ class Database:
                 echo=False
             )
 
+        # sessionmaker 只建一次：以前每次 get_session 都新建一个工厂，白白浪费
+        self._session_factory = sessionmaker(bind=self.engine)
+
     def create_tables(self):
         """创建所有表"""
+        # 注意：这里以前还会 import models_user 来把 v3 的 users / card_keys /
+        # douyin_qrcodes / announcements 一起建出来。那批多用户代码已经删除，
+        # 现在只剩本文件里这几张单用户表。（models.py 本身也已不被 backend.py
+        # 引用，属 v2.2 遗留，详见 docs/archive-v3/README.md。）
         Base.metadata.create_all(self.engine)
 
     def get_session(self) -> Session:
         """获取数据库会话"""
-        from sqlalchemy.orm import sessionmaker
-        SessionLocal = sessionmaker(bind=self.engine)
-        return SessionLocal()
+        return self._session_factory()
 
     def init_default_data(self):
         """初始化默认数据"""
@@ -375,6 +380,15 @@ def get_database(database_url: str = None) -> Database:
     if _db_instance is None:
         _db_instance = Database(database_url)
     return _db_instance
+
+
+def get_session() -> Session:
+    """从全局单例拿一个新会话。
+
+    v3 的 Flask 路由（api_user / api_admin / auth）按「每个请求一个会话、
+    finally 里 close」的方式使用，所以这里每次都返回新会话，不做复用。
+    """
+    return get_database().get_session()
 
 
 def init_database(database_url: str = None):
