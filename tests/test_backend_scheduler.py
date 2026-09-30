@@ -3240,5 +3240,107 @@ class GirlfriendTestCase(unittest.TestCase):
         self.assertIn(captured['text'], backend.FALLBACK_MESSAGES)
 
 
+# ==================== 浏览器启动失败：清理残留 + 重试一次 ====================
+class BrowserStartupRecoveryTestCase(unittest.TestCase):
+    """用户 2026-09-30 遇到的 `session not created: Chrome instance exited`。
+
+    现象：上游后端被强制结束（后台作业被杀），Chrome 被留下继续占着 chrome-profile；
+    下一次启动时 chromedriver 起不来（连 DevToolsActivePort 都没写出来），/healthz 一直
+    browser_ready=false，定时任务全发不出去。修法两件：Windows 也清理残留进程 +
+    启动失败时清理后重试一次。这里不碰真浏览器，只验证这几条不会退化。
+    """
+
+    setUp = ImageSendTestCase.setUp
+    tearDown = ImageSendTestCase.tearDown
+
+    def test_windows_cleanup_never_kills_every_chrome(self):
+        script = backend._windows_cleanup_script(r'C:\some\chrome-profile')
+        self.assertIn(r'C:\some\chrome-profile', script)
+        self.assertIn('chrome.exe', script)
+        self.assertIn('chromedriver.exe', script)
+        # 绝不能出现「按进程名一把杀」那种写法：用户自己的 Chrome 也在跑
+        self.assertNotIn('taskkill', script.lower())
+        self.assertNotIn('Stop-Process -Name', script)
+
+    def test_cleanup_runs_powershell_and_removes_profile_locks(self):
+        if os.name != 'nt':
+            self.skipTest('这段清理只在 Windows 上跑')
+        calls = []
+        self.patch('subprocess', types.SimpleNamespace(
+            DEVNULL=backend.subprocess.DEVNULL,
+            run=lambda cmd, *a, **k: calls.append(cmd),
+        ))
+        locks = ('SingletonCookie', 'SingletonLock', 'SingletonSocket', 'DevToolsActivePort')
+        os.makedirs(backend.CHROME_PROFILE_DIR, exist_ok=True)
+        for name in locks:
+            with open(os.path.join(backend.CHROME_PROFILE_DIR, name), 'w', encoding='utf-8') as handle:
+                handle.write('x')
+
+        backend.cleanup_stale_browser_processes()
+
+        self.assertEqual(len(calls), 1, calls)
+        self.assertIn('powershell', calls[0][0].lower(), calls[0])
+        self.assertIn('-Command', calls[0])
+        self.assertIn(backend.CHROME_PROFILE_DIR, ' '.join(calls[0]))
+        for name in locks:
+            self.assertFalse(os.path.lexists(os.path.join(backend.CHROME_PROFILE_DIR, name)),
+                             '%s 没被清掉：留着它 chromedriver 会去连一个已经死掉的调试端口' % name)
+
+    def test_startup_cleans_up_and_retries_once(self):
+        attempts = []
+        cleaned = []
+
+        class _Bootable:
+            """够 ensure_browser_ready 走完最小路径的 WebDriver 替身。"""
+
+            capabilities = {'browserVersion': '153.0.8010.54'}
+            current_url = 'https://www.douyin.com/chat?isPopup=1'
+
+            def set_window_size(self, *a, **k):
+                pass
+
+            def execute_script(self, *a, **k):
+                return 'complete'
+
+            def get(self, *a, **k):
+                pass
+
+            def find_elements(self, *a, **k):
+                return []
+
+            def get_cookies(self):
+                return []
+
+        def _chrome(*a, **k):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise backend.SessionNotCreatedException(
+                    'session not created: Chrome instance exited. Examine ChromeDriver verbose log')
+            return _Bootable()
+
+        real_time = backend.time
+
+        class _Time:
+            def __getattr__(self, name):
+                return getattr(real_time, name)
+
+            def sleep(self, *_a):
+                return None
+
+        self.patch('webdriver', types.SimpleNamespace(
+            Chrome=_chrome, ChromeOptions=backend.webdriver.ChromeOptions))
+        self.patch('cleanup_stale_browser_processes', lambda: cleaned.append(1))
+        self.patch('time', _Time())
+        self.addCleanup(lambda: setattr(backend, 'init', False))
+
+        result = backend.ensure_browser_ready()
+
+        self.assertIsNone(result, result)
+        self.assertEqual(len(attempts), 2, '第一次启动失败后必须重试一次')
+        self.assertEqual(len(cleaned), 2, '进启动路径时清一次、重试前再清一次')
+        self.assertTrue(backend.init)
+        self.assertIsNotNone(backend.driver)
+
+
 if __name__ == '__main__':
     unittest.main()

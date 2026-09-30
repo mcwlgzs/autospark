@@ -154,15 +154,59 @@ def ensure_display_env():
     return None
 
 
+def _windows_cleanup_script(profile_dir):
+    """生成「只清掉占用本项目 profile 的浏览器」的 PowerShell 命令。
+
+    刻意**不用** `taskkill /IM chrome.exe`：那会把用户自己正在用的 Chrome 一起杀掉，
+    是本程序最不能干的事。判据是进程命令行里的 `--user-data-dir=<本项目 profile>`；
+    chromedriver.exe 没有 profile 参数，且本项目同一时刻只该有一个，所以一律清掉。
+    """
+    safe = str(profile_dir).replace("'", "''")
+    return (
+        "$ErrorActionPreference='SilentlyContinue'; "
+        "Get-CimInstance Win32_Process -Filter \"Name='chrome.exe' or Name='chromedriver.exe'\" | "
+        "Where-Object { $_.Name -eq 'chromedriver.exe' -or ($_.CommandLine -and $_.CommandLine.Contains('%s')) } | "
+        "ForEach-Object { Stop-Process -Id $_.ProcessId -Force }" % safe
+    )
+
+
+def _cleanup_windows_stale_browser():
+    """Windows 上清理残留的 chromedriver 与占用本项目 profile 的 Chrome。
+
+    为什么必须有这一段：这个程序在 Windows 上是「上游被强杀、Chrome 被留下」的常客
+    （后台作业被强制结束、直接关控制台、任务管理器结束进程都不会走优雅退出）。残留的
+    Chrome 占着 user-data-dir，下一次启动就会 `session not created: Chrome instance
+    exited`。Linux 上一直有 pkill 兜底，Windows 上以前是直接 return，等于完全没有兜底 ——
+    2026-09-30 那次浏览器起不来就是这个原因。
+
+    只用 DEVNULL，不抓子进程输出：这段会在启动路径上跑，别再引入管道依赖。
+    """
+    if os.name != 'nt':
+        return
+    powershell = shutil.which('powershell') or 'powershell'
+    try:
+        subprocess.run(
+            [powershell, '-NoProfile', '-NonInteractive', '-Command',
+             _windows_cleanup_script(CHROME_PROFILE_DIR)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=30, check=False,
+        )
+    except Exception:
+        pass
+
+
 def cleanup_stale_browser_processes():
     if os.name == 'nt':
-        return
-    pkill_path = shutil.which('pkill')
-    if pkill_path:
-        for pattern in (CHROMEDRIVER_PATH, CHROME_PROFILE_DIR):
-            if pattern:
-                subprocess.run([pkill_path, '-f', pattern], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        _cleanup_windows_stale_browser()
+    else:
+        pkill_path = shutil.which('pkill')
+        if pkill_path:
+            for pattern in (CHROMEDRIVER_PATH, CHROME_PROFILE_DIR):
+                if pattern:
+                    subprocess.run([pkill_path, '-f', pattern], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
+    # profile 里的锁文件两端都要清（以前这段写在 Windows 的 return 之后，等于没做）：
+    # DevToolsActivePort 留着会让 chromedriver 去连一个已经死掉的调试端口。
     for entry in ('SingletonCookie', 'SingletonLock', 'SingletonSocket', 'DevToolsActivePort'):
         target = os.path.join(CHROME_PROFILE_DIR, entry)
         try:
@@ -4977,9 +5021,24 @@ def ensure_browser_ready():
                 display_value = ensure_display_env()
                 if not display_value:
                     return {'code': 500, 'data': '初始化失败: 未找到可用的 DISPLAY/Xvfb 环境'}
-                cleanup_stale_browser_processes()
+            # 两端都清一遍残留进程与 profile 锁文件。Windows 上这一步以前是整段跳过的，
+            # 于是「上次被强杀留下的 Chrome 占着 profile」直接把新会话顶死。
+            cleanup_stale_browser_processes()
             options = build_chrome_options()
-            driver = webdriver.Chrome(service=service, options=options) if service else webdriver.Chrome(options=options)
+            driver = None
+            for attempt in (1, 2):
+                try:
+                    driver = webdriver.Chrome(service=service, options=options) if service else webdriver.Chrome(options=options)
+                    break
+                except SessionNotCreatedException as exc:
+                    if attempt == 2:
+                        raise
+                    # 「Chrome instance exited」在 Windows 上几乎都是残留进程占着
+                    # user-data-dir，或者上一次被强杀留下的脏 profile；清干净再来一次
+                    # 基本就能起来。只重试一次：驱动版本不匹配这类问题重试多少次都一样。
+                    log_event('warn', '浏览器', '浏览器启动失败，清理残留进程后重试一次', exc)
+                    cleanup_stale_browser_processes()
+                    time.sleep(1.5)
             driver.set_window_size(1400, 3200)
             try:
                 _browser_version = str((driver.capabilities or {}).get('browserVersion') or '')
